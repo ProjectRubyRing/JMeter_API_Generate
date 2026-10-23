@@ -3366,6 +3366,8 @@ def normalize_api(rec, index, cfg):
             kind = bt
     if kind == 'form':
         args = [(k, v, needs_encode(v)) for k, v in split_pairs(body)]
+    if kind == 'json':
+        body = re.sub(r'("(?:[^"\\]|\\.)*")|\u3000', lambda m: m.group(1) or ' ', body)
     ctype = {'json': 'application/json', 'xml': 'application/xml'}.get(kind, '')
     if ctype:
         names = [k.lower() for k, v in headers + cfg['_common_headers']]

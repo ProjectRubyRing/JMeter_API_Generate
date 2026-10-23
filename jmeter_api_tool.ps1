@@ -3386,6 +3386,7 @@ function Normalize-Api($rec, [int]$index, $cfg) {
         $args2 = New-Object System.Collections.Generic.List[object]
         foreach ($x in (Split-Pairs $body)) { $args2.Add(@($x[0], $x[1], (Needs-Encode $x[1]))) }
     }
+    if ($kind -ceq 'json') { $body = [regex]::Replace($body, '("(?:[^"\\]|\\.)*")|\u3000', { param($m) if ($m.Groups[1].Success) { $m.Value } else { ' ' } }) }
     $ctype = ''
     if ($kind -ceq 'json') { $ctype = 'application/json' } elseif ($kind -ceq 'xml') { $ctype = 'application/xml' }
     if ($ctype) {
