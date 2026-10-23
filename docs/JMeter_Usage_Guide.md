@@ -1,6 +1,6 @@
 # JMeter APIテスト 利用方法
 
-> 対象: Apache JMeter 5.6.3 ／ RHEL 9.8 ／ Windows 11 ／ ツール: jmeter_api_tool v1.0.0（2026-10-11 出力）
+> 対象: Apache JMeter 5.6.3 ／ RHEL 9.8 ／ Windows 11 ／ ツール: jmeter_api_tool v1.0.0（2026-10-24 出力）
 
 本書は、REST API の定義（URL・HTTPメソッド・クエリパラメータ・ヘッダ・リクエストボディ）を Excel または CSV に記入し、JMeter のテスト計画ファイル（JMX）を自動生成して実行し、結果を確認するまでの手順をまとめたものです。
 
@@ -189,6 +189,8 @@ input フォルダに次の 3 ファイルが作成されます（既存ファ�
 | HTTP | `connect_timeout` | 接続タイムアウト(ms) | 10000 | -JCONNECT_TIMEOUT |
 | HTTP | `response_timeout` | 応答タイムアウト(ms) | 30000 | -JRESPONSE_TIMEOUT |
 | HTTP | `common_headers` | 共通ヘッダ | （空欄） | 全 API に付けるヘッダ。「名前: 値」を改行区切り（テンプレートの記入例: Accept: application/json / User-Agent: JMeter-API-Test/1.0 / X-Client-Id: ${CLIENT_ID}） |
+| HTTP | `access_token_dir` | アクセストークンのフォルダ | （空欄） | 指定すると、このフォルダ配下のファイルからアクセストークンを読み込み、共通ヘッダに Authorization: Bearer ${ACCESS_TOKEN} を付けます（共通ヘッダに Authorization がある場合はその値を使用）。空欄 = 使わない。JMX からの相対パスまたは絶対パス。-JACCESS_TOKEN_DIR |
+| HTTP | `access_token_file` | アクセストークンのファイル名 | access_token.txt | アクセストークンを書いたファイルの名前（フォルダからの相対パス）。前後の空白・改行は除き、実行中にファイルが更新されると読み直します。-JACCESS_TOKEN_FILE |
 | HTTP | `follow_redirects` | リダイレクト追従 | true | true = 3xx 応答の Location を自動で追従 |
 | HTTP | `keep_alive` | KeepAlive | true | true = 接続を再利用する |
 | HTTP | `default_wait_ms` | 既定の待機時間(ms) | 0 | API一覧の「待機時間」が空欄の API に使う値（0 = 待機なし） |

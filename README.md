@@ -73,6 +73,7 @@ chmod +x jmeter_api_tool.sh
 - 接続先は `${__P(HOST,...)}` 形式の共通変数（`-JHOST=` で環境切替）
 - API ごと: ヘッダ、定数タイマ（待機）、前処理・後処理（JSR223 / Groovy）、正規表現抽出、JSON 抽出、ステータス・本文・応答時間の検証
 - 共通: 連番（Counter）、乱数、CSV データ読込、Excel データ読込（Apache POI 不要）、クッキー管理、共通前処理・後処理、スループット制御（既定は無効）
+- アクセストークン: 設定 `access_token_dir` を指定すると、そのフォルダ配下のファイル（`access_token_file`、既定 `access_token.txt`）からトークンを読み込み、共通ヘッダに `Authorization: Bearer ${ACCESS_TOKEN}` を付けます（実行中のファイル更新に追従。`-JACCESS_TOKEN_DIR` / `-JACCESS_TOKEN_FILE` で変更可）
 - 結果出力: JTL（CSV）、エラー詳細（XML）、結果ログ（api_result.log）、jmeter.log、HTML レポート（run コマンド）
 - 要素名は `[必須]` / `[任意]` で始まり、`[任意]` の要素は JMeter GUI で削除しても他の要素に影響しません。
   生成時に設定で `OFF`（生成しない）/ `DISABLE`（無効状態で生成）も選べます。

@@ -19,6 +19,8 @@ response_timeout,応答タイムアウト(ms),30000,30000,-JRESPONSE_TIMEOUT
 common_headers,共通ヘッダ,"Accept: application/json
 User-Agent: JMeter-API-Test/1.0
 X-Client-Id: ${CLIENT_ID}",（空欄）,全 API に付けるヘッダ。「名前: 値」を改行区切り
+access_token_dir,アクセストークンのフォルダ,,（空欄）,指定すると、このフォルダ配下のファイルからアクセストークンを読み込み、共通ヘッダに Authorization: Bearer ${ACCESS_TOKEN} を付けます（共通ヘッダに Authorization がある場合はその値を使用）。空欄 = 使わない。JMX からの相対パスまたは絶対パス。-JACCESS_TOKEN_DIR
+access_token_file,アクセストークンのファイル名,access_token.txt,access_token.txt,アクセストークンを書いたファイルの名前（フォルダからの相対パス）。前後の空白・改行は除き、実行中にファイルが更新されると読み直します。-JACCESS_TOKEN_FILE
 follow_redirects,リダイレクト追従,true,true,true = 3xx 応答の Location を自動で追従
 keep_alive,KeepAlive,true,true,true = 接続を再利用する
 default_wait_ms,既定の待機時間(ms),0,0,API一覧の「待機時間」が空欄の API に使う値（0 = 待機なし）
