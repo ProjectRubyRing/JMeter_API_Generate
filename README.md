@@ -63,7 +63,7 @@ chmod +x jmeter_api_tool.sh
 | 備考 | 概要・説明・operationId・認可（security）・API Gateway 統合など |
 
 - 設定は Excel / CSV と同じく `-s` または「入力ファイル名_settings.csv」から読み込みます。設定ファイルで空欄の `base_url`（`servers[0].url`。無い場合は `http://localhost:8080`）、`test_plan_name`、`output_file`（`<タイトル>.jmx`）は OpenAPI 定義の値を使います。
-- 認証ヘッダ（Authorization・X-API-KEY）はランダム値では通らないため生成しません。設定 `common_headers` に指定してください。
+- 認証ヘッダ（Authorization・API-Key）はランダム値では通らないため生成しません。設定 `common_headers` に指定してください。
 - OpenAPI 用のオプション（sh / PowerShell）: `--seed` / `-Seed`（乱数シード）、`--any-method` / `-AnyMethod`、`--required-only` / `-RequiredOnly`、`--use-examples` / `-UseExamples`、`--placeholder-value` / `-PlaceholderValue`（意味は JMeter_Tools と同じ）。
 - GET / DELETE のリクエストボディは Excel / CSV と同じ規則で送信しません（警告を表示）。YAML・Swagger 2.0・外部ファイルへの `$ref` は対象外です。
 

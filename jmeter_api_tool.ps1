@@ -3010,7 +3010,7 @@ function Build-Manual([string]$outDir) {
 #    - Get-Prop を Get-OaProp に、$script:Warnings を $script:OaWarnings に改名した
 #      （このツールの Get-Prop・$script:Warnings と名前が重なるため）
 #    - New-OperationRequest の「6. 組み立て」を、API一覧（Excel / CSV）の 1 行と同じ項目を返すように変更した
-#    - ヘッダ X-API-KEY の警告文（このツールには共通の X-API-KEY が無いため）
+#    - ヘッダ API-Key の警告文（このツールには共通の API-Key が無いため）
 #  末尾の Get-OaRowPairs / Get-OaServerUrl / Load-OpenApi がこのツール用に追加した処理です。
 #  RHEL 版 jmeter_api_tool.sh の同じ処理と同一の乱数列・同一の結果になります。
 # =============================================================================
@@ -4487,7 +4487,7 @@ function New-OperationRequest($info, [string]$Label) {
         $name = [string]$p['name']
         $lname = $name.ToLowerInvariant()
         if ($script:SKIP_HEADERS -ccontains $lname) { continue }
-        if ($lname -ceq 'x-api-key') {
+        if ($lname -ceq 'api-key') {
             Add-Warn ('{0}: ヘッダ {1} は API キーの実値が必要なため生成しません（設定 common_headers に「{1}: キーの値」を指定してください）' -f $Label, $name)
             continue
         }

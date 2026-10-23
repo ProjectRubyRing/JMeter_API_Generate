@@ -3006,7 +3006,7 @@ def build_manual(out_dir):
 #    - GenError を ToolError の派生クラスにした（[ERROR] として表示するため）
 #    - pct_encode を oa_pct_encode に改名した（このツールの pct_encode と名前が重なるため）
 #    - build_operation の「6. 組み立て」を、API一覧（Excel / CSV）の 1 行と同じ項目を返すように変更した
-#    - ヘッダ X-API-KEY の警告文（このツールには共通の X-API-KEY が無いため）
+#    - ヘッダ API-Key の警告文（このツールには共通の API-Key が無いため）
 #  末尾の oa_row_pairs / oa_server_url / load_openapi がこのツール用に追加した処理です。
 #  Windows 版 jmeter_api_tool.ps1 の同じ処理と同一の乱数列・同一の結果になります。
 # =============================================================================
@@ -4411,7 +4411,7 @@ def build_operation(ctx, info, label):
         lname = name.lower()
         if lname in SKIP_HEADERS:
             continue
-        if lname == 'x-api-key':
+        if lname == 'api-key':
             ctx.warn('%s: ヘッダ %s は API キーの実値が必要なため生成しません（設定 common_headers に「%s: キーの値」を指定してください）'
                      % (label, name, name))
             continue
