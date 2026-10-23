@@ -1,6 +1,6 @@
 # JMeter API テスト JMX 生成ツール（jmeter_api_tool）
 
-REST API の定義（URL・HTTP メソッド・クエリパラメータ・ヘッダ・リクエストボディ）を **Excel または CSV** に記入すると、
+REST API の定義（URL・HTTP メソッド・クエリパラメータ・ヘッダ・リクエストボディ）を **Excel または CSV** に記入するか、**OpenAPI 定義（JSON）** を指定すると、
 **Apache JMeter 5.6.3** 用の JMX ファイルを自動生成し、CLI モードで実行して JTL・HTML レポート・ログを出力するツールです。
 
 - RHEL 9.8 用: `jmeter_api_tool.sh`（bash + OS 標準の python3。追加インストール不要）
@@ -29,6 +29,7 @@ REST API の定義（URL・HTTP メソッド・クエリパラメータ・ヘッ
 chmod +x jmeter_api_tool.sh
 ./jmeter_api_tool.sh init                                   # 入力テンプレートを作成（input/）
 ./jmeter_api_tool.sh generate -i input/api_definition.xlsx  # JMX を生成（output/）
+./jmeter_api_tool.sh generate -i openapi.json --seed 12345  # OpenAPI 定義（JSON）から JMX を生成
 ./jmeter_api_tool.sh run -t output/api_test.jmx             # CLI 実行（result/JMX名_日時/）
 ./jmeter_api_tool.sh run -t output/api_test.jmx --threads 10 --loops 100   # 大量実行
 ./jmeter_api_tool.sh manual                                 # 利用方法を出力（docs/）
@@ -39,6 +40,7 @@ chmod +x jmeter_api_tool.sh
 ```powershell
 .\jmeter_api_tool.bat init
 .\jmeter_api_tool.bat generate -i input\api_definition.xlsx
+.\jmeter_api_tool.bat generate -i openapi.json -Seed 12345
 .\jmeter_api_tool.bat run -t output\api_test.jmx
 .\jmeter_api_tool.bat run -t output\api_test.jmx -Threads 10 -Loops 100
 .\jmeter_api_tool.bat manual
@@ -46,6 +48,24 @@ chmod +x jmeter_api_tool.sh
 
 `run` コマンドには Java（17 推奨）と JMeter 5.6.3 が必要です（`JMETER_HOME` を設定するか `--jmeter-home` / `-JMeterHome` で指定）。
 `init` / `generate` / `manual` は JMeter・Java が無くても動作します。
+
+## OpenAPI 定義（JSON）からの生成
+
+`-i` に OpenAPI 3.0.x の JSON（拡張子 `.json`）を指定すると、Excel / CSV と同じ「API一覧」の 1 行 = 1 API に変換してから JMX を生成します。
+定義の読み込みとテストデータの生成は JMeter_Tools の `openapi2jmx`（`OpenApi2Jmx.ps1`）と同じ処理で、同じシードなら同じテストデータになります。
+
+| API一覧の列 | OpenAPI から設定する値 |
+|---|---|
+| No / 有効 / API名 | 定義の順番 / Y / `メソッド パス [operationId]`（ANY は `ANY(GET) パス`） |
+| URL | パス（パスパラメータはデータ型に合ったランダム値）。接続先は設定 `base_url` |
+| クエリパラメータ・ヘッダ・ボディ形式・リクエストボディ | パラメータ・requestBody の定義から生成（style / explode、JSON / フォーム / multipart / XML / テキスト） |
+| 期待ステータス | 2xx の応答コード（`2XX` だけの場合は空欄） |
+| 備考 | 概要・説明・operationId・認可（security）・API Gateway 統合など |
+
+- 設定は Excel / CSV と同じく `-s` または「入力ファイル名_settings.csv」から読み込みます。設定ファイルで空欄の `base_url`（`servers[0].url`。無い場合は `http://localhost:8080`）、`test_plan_name`、`output_file`（`<タイトル>.jmx`）は OpenAPI 定義の値を使います。
+- 認証ヘッダ（Authorization・X-API-KEY）はランダム値では通らないため生成しません。設定 `common_headers` に指定してください。
+- OpenAPI 用のオプション（sh / PowerShell）: `--seed` / `-Seed`（乱数シード）、`--any-method` / `-AnyMethod`、`--required-only` / `-RequiredOnly`、`--use-examples` / `-UseExamples`、`--placeholder-value` / `-PlaceholderValue`（意味は JMeter_Tools と同じ）。
+- GET / DELETE のリクエストボディは Excel / CSV と同じ規則で送信しません（警告を表示）。YAML・Swagger 2.0・外部ファイルへの `$ref` は対象外です。
 
 ## 生成される JMX の主な内容
 

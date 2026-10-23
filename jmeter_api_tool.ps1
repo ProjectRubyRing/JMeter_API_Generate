@@ -3,7 +3,7 @@
   jmeter_api_tool.ps1 v1.0.0 （Windows 11 用 / Windows PowerShell 5.1・PowerShell 7）
 
 .DESCRIPTION
-  REST API の定義（Excel / CSV）から Apache JMeter 5.6.3 用の JMX を生成し、
+  REST API の定義（Excel / CSV / OpenAPI）から Apache JMeter 5.6.3 用の JMX を生成し、
   CLI モードで実行して JTL・HTML レポート・ログを出力するツールです。
   追加モジュール・Excel のインストールは不要です（xlsx は ZIP + XML として直接読み書きします）。
   ※ 処理内容は RHEL 版 jmeter_api_tool.sh と同一です。
@@ -31,7 +31,12 @@ param(
     [string]$Heap = '',
     [string]$JMeterHome = '',
     [switch]$FailOnError,
-    [string]$ExtraArgs = ''
+    [string]$ExtraArgs = '',
+    [string]$Seed = '',
+    [string]$AnyMethod = 'GET',
+    [switch]$RequiredOnly,
+    [switch]$UseExamples,
+    [string]$PlaceholderValue = '3000'
 )
 
 Set-StrictMode -Version 2.0
@@ -2978,6 +2983,1831 @@ function Build-Manual([string]$outDir) {
     return @(($base + '.xlsx'), ($base + '.md'))
 }
 
+# ----------------------------------------------------------------------------- OpenAPI loading
+# =============================================================================
+#  OpenAPI 3.0.x 定義（JSON）の読み込み
+#  JMeter_Tools の windows/OpenApi2Jmx.ps1 から、定義の読み込み・テストデータ生成の処理を
+#  そのまま移植したものです（JMX 出力の部分は除く）。移植時の変更点は次のとおりです。
+#    - Get-Prop を Get-OaProp に、$script:Warnings を $script:OaWarnings に改名した
+#      （このツールの Get-Prop・$script:Warnings と名前が重なるため）
+#    - New-OperationRequest の「6. 組み立て」を、API一覧（Excel / CSV）の 1 行と同じ項目を返すように変更した
+#    - ヘッダ X-API-KEY の警告文（このツールには共通の X-API-KEY が無いため）
+#  末尾の Get-OaRowPairs / Get-OaServerUrl / Load-OpenApi がこのツール用に追加した処理です。
+#  RHEL 版 jmeter_api_tool.sh の同じ処理と同一の乱数列・同一の結果になります。
+# =============================================================================
+class JNum {
+    [string]$Text
+    JNum([string]$t) { $this.Text = $t }
+}
+
+$script:SKIP = New-Object System.Object
+
+function Stop-Gen([string]$Message) {
+    $ex = New-Object System.InvalidOperationException($Message)
+    $ex.Data['OA2J'] = $true
+    throw $ex
+}
+
+# ----------------------------------------------------------------- 乱数（両実装共通）
+$script:RngState = 1L
+
+function Initialize-Rng([long]$SeedValue) {
+    $script:RngState = ($SeedValue % 2147483646L) + 1L
+}
+
+function Get-Next31 {
+    $script:RngState = ($script:RngState * 48271L) % 2147483647L
+    return $script:RngState
+}
+
+function Get-Between([long]$Lo, [long]$Hi) {
+    if ($Hi -le $Lo) { return $Lo }
+    $span = $Hi - $Lo + 1L
+    if ($span -le 2147483646L) {
+        $n = Get-Next31
+        return [long]($Lo + (($n - 1L) % $span))
+    }
+    $a = (Get-Next31) - 1L
+    $b = (Get-Next31) - 1L
+    $r = $a * 2147483646L + $b
+    return [long]($Lo + ($r % $span))
+}
+
+# ----------------------------------------------------------------- 値の判定・取得
+$script:UNITS_LIMIT = 1000000000000000000L
+$script:MAX_DECIMALS = 12
+$script:MAX_DEPTH = 12
+$script:ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+$script:LOWER_ALNUM = 'abcdefghijklmnopqrstuvwxyz0123456789'
+$script:HEXD = '0123456789abcdef'
+$script:EPOCH_START = 1735689600L
+$script:EPOCH_END = 1798761599L
+
+function Test-Obj($x) { return ($x -is [System.Collections.IDictionary]) }
+function Test-Arr($x) { return (($x -is [System.Collections.IList]) -and -not ($x -is [string])) }
+function Test-Str($x) { return ($x -is [string]) }
+function Test-Bool($x) { return ($x -is [bool]) }
+function Test-Int($x) { return (($x -is [long]) -or ($x -is [int])) }
+function Test-Dec($x) { return ($x -is [decimal]) }
+function Test-Num($x) { return ((Test-Int $x) -or (Test-Dec $x)) }
+function Test-Skip($x) { return [object]::ReferenceEquals($x, $script:SKIP) }
+
+function Test-Has($o, [string]$k) {
+    if ($o -is [System.Collections.Generic.Dictionary[string, object]]) { return $o.ContainsKey($k) }
+    if ($o -is [System.Collections.Specialized.OrderedDictionary]) { return $o.Contains($k) }
+    if ($o -is [System.Collections.IDictionary]) { return $o.Contains($k) }
+    return $false
+}
+
+function Get-OaProp($o, [string]$k) {
+    if (Test-Has $o $k) { return , ($o[$k]) }
+    return $null
+}
+
+function New-OMap { return , (New-Object System.Collections.Specialized.OrderedDictionary) }
+function New-OList { return , (New-Object 'System.Collections.Generic.List[object]') }
+
+function Copy-OMap($src) {
+    $r = New-Object System.Collections.Specialized.OrderedDictionary
+    foreach ($k in @($src.Keys)) { $r[[string]$k] = $src[$k] }
+    return , $r
+}
+
+function ConvertTo-Dec($x) {
+    if (Test-Int $x) { return [decimal]$x }
+    if (Test-Dec $x) { return $x }
+    return $null
+}
+
+function Format-Dec([decimal]$d) { return $d.ToString($script:Inv) }
+
+function Limit-DecTo([decimal]$d, [decimal]$Lim) {
+    if ($d -gt $Lim) { return $Lim }
+    if ($d -lt (-$Lim)) { return (-$Lim) }
+    return $d
+}
+
+function Get-IntOrNull($x) {
+    if (Test-Int $x) { if ($x -ge 0) { return [long]$x } else { return $null } }
+    if ((Test-Dec $x) -and ([decimal]::Truncate($x) -eq $x) -and ($x -ge 0)) { return [long]$x }
+    return $null
+}
+
+function Get-Pow10([int]$d) {
+    $p = 1L
+    for ($i = 0; $i -lt $d; $i++) { $p = $p * 10L }
+    return $p
+}
+
+function Get-FloorDiv([long]$a, [long]$b) {
+    $rem = 0L
+    $q = [System.Math]::DivRem($a, $b, [ref]$rem)
+    if (($rem -ne 0) -and (($rem -lt 0) -ne ($b -lt 0))) { $q = $q - 1L }
+    return [long]$q
+}
+
+function Get-CeilDiv([long]$a, [long]$b) { return [long](-(Get-FloorDiv (-$a) $b)) }
+
+function ConvertTo-GenValue($x) {
+    if ($null -eq $x) { return $null }
+    if ($x -is [bool]) { return $x }
+    if (Test-Int $x) { return [JNum]::new(([long]$x).ToString($script:Inv)) }
+    if (Test-Dec $x) { return [JNum]::new((Format-Dec $x)) }
+    if ($x -is [string]) { return $x }
+    if (Test-Arr $x) {
+        $l = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($i in $x) { $l.Add((ConvertTo-GenValue $i)) }
+        return , $l
+    }
+    if (Test-Obj $x) {
+        $o = New-Object System.Collections.Specialized.OrderedDictionary
+        foreach ($k in @($x.Keys)) { $o[[string]$k] = (ConvertTo-GenValue $x[$k]) }
+        return , $o
+    }
+    return [string]$x
+}
+
+# ----------------------------------------------------------------- 文字列の整形
+function Get-CleanText([string]$s) {
+    if ($null -eq $s) { return '' }
+    $sb = New-Object System.Text.StringBuilder
+    $n = $s.Length
+    for ($i = 0; $i -lt $n; $i++) {
+        $c = [int]$s[$i]
+        if (($c -ge 0xD800) -and ($c -le 0xDBFF)) {
+            if (($i + 1 -lt $n) -and ([int]$s[$i + 1] -ge 0xDC00) -and ([int]$s[$i + 1] -le 0xDFFF)) {
+                [void]$sb.Append($s[$i]).Append($s[$i + 1])
+                $i++
+            }
+            continue
+        }
+        if (($c -ge 0xDC00) -and ($c -le 0xDFFF)) { continue }
+        if (($c -eq 9) -or ($c -eq 10) -or ($c -eq 13) -or (($c -ge 0x20) -and ($c -le 0xD7FF)) -or (($c -ge 0xE000) -and ($c -le 0xFFFD))) {
+            [void]$sb.Append($s[$i])
+        }
+    }
+    return $sb.ToString()
+}
+
+function Get-JsonStr([string]$s) {
+    $s = Get-CleanText $s
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('"')
+    foreach ($ch in $s.ToCharArray()) {
+        switch -CaseSensitive ($ch) {
+            '"' { [void]$sb.Append('\"'); break }
+            '\' { [void]$sb.Append('\\'); break }
+            "`n" { [void]$sb.Append('\n'); break }
+            "`r" { [void]$sb.Append('\r'); break }
+            "`t" { [void]$sb.Append('\t'); break }
+            default { [void]$sb.Append($ch) }
+        }
+    }
+    [void]$sb.Append('"')
+    return $sb.ToString()
+}
+
+function ConvertTo-JsonText($v, [int]$Indent, [bool]$Pretty) {
+    if ($null -eq $v) { return 'null' }
+    if ($v -is [bool]) { if ($v) { return 'true' } else { return 'false' } }
+    if ($v -is [JNum]) { return $v.Text }
+    if ($v -is [string]) { return (Get-JsonStr $v) }
+    if (Test-Obj $v) {
+        if ($v.Count -eq 0) { return '{}' }
+        $parts = New-Object 'System.Collections.Generic.List[string]'
+        if (-not $Pretty) {
+            foreach ($k in @($v.Keys)) { $parts.Add((Get-JsonStr ([string]$k)) + ':' + (ConvertTo-JsonText $v[$k] 0 $false)) }
+            return '{' + [string]::Join(',', $parts) + '}'
+        }
+        $pad = '  ' * ($Indent + 1)
+        foreach ($k in @($v.Keys)) { $parts.Add($pad + (Get-JsonStr ([string]$k)) + ': ' + (ConvertTo-JsonText $v[$k] ($Indent + 1) $true)) }
+        return "{`n" + [string]::Join(",`n", $parts) + "`n" + ('  ' * $Indent) + '}'
+    }
+    if (Test-Arr $v) {
+        if ($v.Count -eq 0) { return '[]' }
+        $parts = New-Object 'System.Collections.Generic.List[string]'
+        if (-not $Pretty) {
+            foreach ($x in $v) { $parts.Add((ConvertTo-JsonText $x 0 $false)) }
+            return '[' + [string]::Join(',', $parts) + ']'
+        }
+        $pad = '  ' * ($Indent + 1)
+        foreach ($x in $v) { $parts.Add($pad + (ConvertTo-JsonText $x ($Indent + 1) $true)) }
+        return "[`n" + [string]::Join(",`n", $parts) + "`n" + ('  ' * $Indent) + ']'
+    }
+    return (Get-JsonStr ([string]$v))
+}
+
+function Get-ScalarStr($v) {
+    if ($null -eq $v) { return '' }
+    if ($v -is [bool]) { if ($v) { return 'true' } else { return 'false' } }
+    if ($v -is [JNum]) { return $v.Text }
+    if ($v -is [string]) { return $v }
+    return (ConvertTo-JsonText $v 0 $false)
+}
+
+function Get-PctEncode([string]$s, [bool]$KeepSlash) {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes((Get-CleanText $s))
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($b in $bytes) {
+        $isUnreserved = (($b -ge 0x41) -and ($b -le 0x5A)) -or (($b -ge 0x61) -and ($b -le 0x7A)) -or (($b -ge 0x30) -and ($b -le 0x39)) -or ($b -eq 0x2D) -or ($b -eq 0x2E) -or ($b -eq 0x5F) -or ($b -eq 0x7E)
+        if ($isUnreserved -or ($KeepSlash -and ($b -eq 0x2F))) {
+            [void]$sb.Append([char]$b)
+        } else {
+            [void]$sb.Append('%').Append($b.ToString('X2'))
+        }
+    }
+    return $sb.ToString()
+}
+
+function Get-HeaderSafe([string]$s) {
+    return (Get-CleanText $s).Replace("`r", ' ').Replace("`n", ' ').Replace("`t", ' ')
+}
+
+function Get-SafeName([string]$s) {
+    $s = [regex]::Replace($s, '[^A-Za-z0-9._-]+', '_')
+    $s = [regex]::Replace($s, '_+', '_').Trim([char[]]@('_', '.'))
+    if ($s.Length -eq 0) { return 'openapi' }
+    return $s
+}
+
+function Get-CpLen([string]$s) {
+    $n = 0
+    foreach ($ch in $s.ToCharArray()) {
+        $c = [int]$ch
+        if (-not (($c -ge 0xDC00) -and ($c -le 0xDFFF))) { $n++ }
+    }
+    return $n
+}
+
+function ConvertFrom-CodePoint([int]$c) { return [char]::ConvertFromUtf32($c) }
+
+# ----------------------------------------------------------------- 生成コンテキスト
+$script:Doc = $null
+$script:SeedValue = 0L
+$script:OptRequiredOnly = $false
+$script:OptUseExamples = $false
+$script:OptAnyMethod = 'GET'
+$script:OaWarnings = New-Object 'System.Collections.Generic.List[string]'
+
+function Add-Warn([string]$m) {
+    if (-not $script:OaWarnings.Contains($m)) { $script:OaWarnings.Add($m) }
+}
+
+function Get-UnescapedToken([string]$tok) {
+    if ($tok.Contains('%')) {
+        try { $tok = [System.Uri]::UnescapeDataString($tok) } catch { }
+    }
+    return $tok.Replace('~1', '/').Replace('~0', '~')
+}
+
+function Resolve-Ref($ref) {
+    if (-not (Test-Str $ref)) { return $null }
+    if (-not $ref.StartsWith('#', [System.StringComparison]::Ordinal)) { return $null }
+    if (($ref -ceq '#') -or ($ref -ceq '#/')) { return , $script:Doc }
+    if (-not $ref.StartsWith('#/', [System.StringComparison]::Ordinal)) { return $null }
+    $cur = $script:Doc
+    foreach ($tok in $ref.Substring(2).Split([char]'/')) {
+        $key = Get-UnescapedToken $tok
+        if ((Test-Obj $cur) -and (Test-Has $cur $key)) {
+            $cur = $cur[$key]
+        } elseif ((Test-Arr $cur) -and ($key -cmatch '^(0|[1-9][0-9]*)$') -and ([long]$key -lt $cur.Count)) {
+            $cur = $cur[[int]$key]
+        } else {
+            return $null
+        }
+    }
+    return , $cur
+}
+
+function Get-RefText($ref) {
+    if (Test-Str $ref) { return $ref }
+    return '(不正な $ref)'
+}
+
+function Resolve-Deref($obj, [string]$What) {
+    $seen = New-Object 'System.Collections.Generic.List[string]'
+    while ((Test-Obj $obj) -and (Test-Has $obj '$ref')) {
+        $rt = Get-RefText $obj['$ref']
+        if ($seen.Contains($rt) -or ($seen.Count -gt 32)) {
+            Add-Warn ('{0} の $ref が循環しています: {1}' -f $What, $rt)
+            return $null
+        }
+        $seen.Add($rt)
+        $target = Resolve-Ref $obj['$ref']
+        if ($null -eq $target) {
+            Add-Warn ('{0} の $ref を解決できません（外部ファイル参照は未対応）: {1}' -f $What, $rt)
+            return $null
+        }
+        $obj = $target
+    }
+    return , $obj
+}
+
+# ----------------------------------------------------------------- スキーマ → テストデータ
+$script:TYPES = @('object', 'array', 'integer', 'number', 'boolean', 'string', 'null')
+
+function Get-SchemaType($schema) {
+    $t = Get-OaProp $schema 'type'
+    if (Test-Arr $t) {
+        $names = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($x in $t) { if (Test-Str $x) { $names.Add($x) } }
+        $nonNull = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($x in $names) { if ($x -cne 'null') { $nonNull.Add($x) } }
+        if ($nonNull.Count -gt 0) { $t = $nonNull[0] }
+        elseif ($names.Count -gt 0) { $t = 'null' }
+        else { $t = $null }
+    }
+    if ((Test-Str $t) -and ($script:TYPES -ccontains $t)) { return $t }
+    if ((Test-Has $schema 'properties') -or (Test-Has $schema 'additionalProperties') -or (Test-Has $schema 'minProperties') -or (Test-Has $schema 'maxProperties')) { return 'object' }
+    if ((Test-Has $schema 'items') -or (Test-Has $schema 'minItems') -or (Test-Has $schema 'maxItems')) { return 'array' }
+    $fmt = Get-OaProp $schema 'format'
+    if ((Test-Str $fmt) -and (($fmt -ceq 'int32') -or ($fmt -ceq 'int64'))) { return 'integer' }
+    if ((Test-Str $fmt) -and (($fmt -ceq 'float') -or ($fmt -ceq 'double'))) { return 'number' }
+    if ((Test-Has $schema 'minimum') -or (Test-Has $schema 'maximum') -or (Test-Has $schema 'multipleOf') -or (Test-Has $schema 'exclusiveMinimum') -or (Test-Has $schema 'exclusiveMaximum')) { return 'number' }
+    return 'string'
+}
+
+function Test-ListContains($list, $value) {
+    foreach ($x in $list) {
+        if (($x -is [string]) -and ($value -is [string])) { if ($x -ceq $value) { return $true } }
+        elseif ([object]::Equals($x, $value)) { return $true }
+    }
+    return $false
+}
+
+function Merge-Schemas($a, $b) {
+    $r = Copy-OMap $a
+    foreach ($k in @($b.Keys)) {
+        $key = [string]$k
+        $v = $b[$k]
+        if (($key -ceq 'properties') -and (Test-Obj $v)) {
+            $cur = Get-OaProp $r 'properties'
+            if (Test-Obj $cur) { $props = Copy-OMap $cur } else { $props = New-OMap }
+            foreach ($pk in @($v.Keys)) { if (-not $props.Contains([string]$pk)) { $props[[string]$pk] = $v[$pk] } }
+            $r['properties'] = $props
+        } elseif (($key -ceq 'required') -and (Test-Arr $v)) {
+            $req = New-Object 'System.Collections.Generic.List[object]'
+            $cur = Get-OaProp $r 'required'
+            if (Test-Arr $cur) { foreach ($x in $cur) { $req.Add($x) } }
+            foreach ($x in $v) { if (-not (Test-ListContains $req $x)) { $req.Add($x) } }
+            $r['required'] = $req
+        } elseif (-not $r.Contains($key)) {
+            $r[$key] = $v
+        }
+    }
+    return , $r
+}
+
+# 戻り値: @{ S = 実体 or $null; Stack = List[string]; State = 'ok'|'cycle'|'unresolved' }
+function Resolve-SchemaRef($s, $stack) {
+    $cur = $s
+    $st = $stack
+    while ((Test-Obj $cur) -and (Test-Has $cur '$ref')) {
+        $rt = Get-RefText $cur['$ref']
+        if ($st.Contains($rt)) { return @{ S = $null; Stack = $st; State = 'cycle' } }
+        $t = Resolve-Ref $cur['$ref']
+        if ($null -eq $t) {
+            Add-Warn ('スキーマの $ref を解決できません（外部ファイル参照は未対応）: ' + $rt)
+            return @{ S = $null; Stack = $st; State = 'unresolved' }
+        }
+        $ns = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($x in $st) { $ns.Add($x) }
+        $ns.Add($rt)
+        $st = $ns
+        $cur = $t
+    }
+    return @{ S = $cur; Stack = $st; State = 'ok' }
+}
+
+function Merge-AllOf($schema, $stack) {
+    $result = New-Object System.Collections.Specialized.OrderedDictionary
+    foreach ($k in @($schema.Keys)) { if ([string]$k -cne 'allOf') { $result[[string]$k] = $schema[$k] } }
+    foreach ($sub in $schema['allOf']) {
+        $res = Resolve-SchemaRef $sub $stack
+        if (($res.State -cne 'ok') -or -not (Test-Obj $res.S)) { continue }
+        $s = $res.S
+        if (Test-Arr (Get-OaProp $s 'allOf')) { $s = Merge-AllOf $s $res.Stack }
+        $result = Merge-Schemas $result $s
+    }
+    return , $result
+}
+
+function New-Gen($schema, [int]$Depth, $stack) {
+    if (($null -eq $schema) -or (($schema -is [bool]) -and $schema)) { $schema = New-OMap }
+    if (($schema -is [bool]) -or -not (Test-Obj $schema)) { return $script:SKIP }
+    if (Test-Has $schema '$ref') {
+        $res = Resolve-SchemaRef $schema $stack
+        if ($res.State -ceq 'cycle') { return $script:SKIP }
+        if ($res.State -ceq 'unresolved') { return 'UNRESOLVED_REF' }
+        return , (New-Gen $res.S $Depth $res.Stack)
+    }
+    if ($Depth -gt $script:MAX_DEPTH) { return $script:SKIP }
+    if (Test-Arr (Get-OaProp $schema 'allOf')) { $schema = Merge-AllOf $schema $stack }
+    foreach ($key in @('oneOf', 'anyOf')) {
+        $alts = Get-OaProp $schema $key
+        if ((Test-Arr $alts) -and ($alts.Count -gt 0)) {
+            $base = New-Object System.Collections.Specialized.OrderedDictionary
+            foreach ($k in @($schema.Keys)) { if (([string]$k -cne 'oneOf') -and ([string]$k -cne 'anyOf')) { $base[[string]$k] = $schema[$k] } }
+            $res = Resolve-SchemaRef $alts[0] $stack
+            if ($res.State -ceq 'cycle') { return $script:SKIP }
+            if ($res.State -ceq 'unresolved') { return 'UNRESOLVED_REF' }
+            $alt = $res.S
+            if (-not (Test-Obj $alt)) { $alt = New-OMap }
+            return , (New-Gen (Merge-Schemas $base $alt) $Depth $res.Stack)
+        }
+    }
+    if ($script:OptUseExamples) {
+        if (Test-Has $schema 'example') { return , (ConvertTo-GenValue $schema['example']) }
+        $exs = Get-OaProp $schema 'examples'
+        if ((Test-Arr $exs) -and ($exs.Count -gt 0)) { return , (ConvertTo-GenValue $exs[0]) }
+        if (Test-Has $schema 'default') { return , (ConvertTo-GenValue $schema['default']) }
+    }
+    if (Test-Has $schema 'const') { return , (ConvertTo-GenValue $schema['const']) }
+    $enum = Get-OaProp $schema 'enum'
+    if ((Test-Arr $enum) -and ($enum.Count -gt 0)) {
+        $cands = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($e in $enum) { if ($null -ne $e) { $cands.Add($e) } }
+        if ($cands.Count -eq 0) { return $null }
+        return , (ConvertTo-GenValue $cands[[int](Get-Between 0 ($cands.Count - 1))])
+    }
+    $t = Get-SchemaType $schema
+    switch -CaseSensitive ($t) {
+        'object' { return , (New-GenObject $schema $Depth $stack) }
+        'array' { return , (New-GenArray $schema $Depth $stack) }
+        'integer' { return (New-GenInteger $schema) }
+        'number' { return (New-GenNumber $schema) }
+        'boolean' { return ((Get-Between 0 1) -eq 1) }
+        'null' { return $null }
+    }
+    return (New-GenString $schema)
+}
+
+function Test-ReadOnly($pschema) {
+    $s = $pschema
+    $guard = 0
+    while ((Test-Obj $s) -and (Test-Has $s '$ref') -and ($guard -lt 32)) {
+        $s = Resolve-Ref $s['$ref']
+        $guard++
+    }
+    if (-not (Test-Obj $s)) { return $false }
+    $ro = Get-OaProp $s 'readOnly'
+    return (($ro -is [bool]) -and $ro)
+}
+
+function New-GenObject($schema, [int]$Depth, $stack) {
+    $result = New-Object System.Collections.Specialized.OrderedDictionary
+    $props = Get-OaProp $schema 'properties'
+    $req = Get-OaProp $schema 'required'
+    $required = New-Object 'System.Collections.Generic.List[string]'
+    if (Test-Arr $req) { foreach ($x in $req) { if (Test-Str $x) { $required.Add($x) } } }
+    if (Test-Obj $props) {
+        foreach ($nk in @($props.Keys)) {
+            $name = [string]$nk
+            if ($script:OptRequiredOnly -and -not $required.Contains($name)) { continue }
+            $pschema = $props[$nk]
+            if (Test-ReadOnly $pschema) { continue }
+            $v = New-Gen $pschema ($Depth + 1) $stack
+            if (Test-Skip $v) { continue }
+            $result[$name] = $v
+        }
+    }
+    $addl = Get-OaProp $schema 'additionalProperties'
+    $propsCount = 0
+    if (Test-Obj $props) { $propsCount = $props.Count }
+    if (($result.Count -eq 0) -and ($propsCount -eq 0) -and (Test-Obj $addl) -and ($addl.Count -gt 0) -and -not $script:OptRequiredOnly) {
+        $v = New-Gen $addl ($Depth + 1) $stack
+        if (-not (Test-Skip $v)) { $result['key1'] = $v }
+    }
+    return , $result
+}
+
+function New-GenArray($schema, [int]$Depth, $stack) {
+    $items = Get-OaProp $schema 'items'
+    if (-not (Test-Obj $items)) { $items = New-OMap }
+    $mn = Get-IntOrNull (Get-OaProp $schema 'minItems')
+    $mx = Get-IntOrNull (Get-OaProp $schema 'maxItems')
+    $n = 0L
+    if ($null -ne $mn) { $n = $mn }
+    if ($n -lt 1) { $n = 1L }
+    if (($null -ne $mx) -and ($n -gt $mx)) { $n = $mx }
+    if ($n -gt 50) { $n = 50L }
+    $uq = Get-OaProp $schema 'uniqueItems'
+    $unique = (($uq -is [bool]) -and $uq)
+    $result = New-Object 'System.Collections.Generic.List[object]'
+    $seen = New-Object 'System.Collections.Generic.List[string]'
+    for ($i = 0; $i -lt $n; $i++) {
+        $v = New-Gen $items ($Depth + 1) $stack
+        if (Test-Skip $v) { break }
+        if ($unique) {
+            $key = ConvertTo-JsonText $v 0 $false
+            $tries = 0
+            while ($seen.Contains($key) -and ($tries -lt 10)) {
+                $v = New-Gen $items ($Depth + 1) $stack
+                if (Test-Skip $v) { break }
+                $key = ConvertTo-JsonText $v 0 $false
+                $tries++
+            }
+            if (Test-Skip $v) { break }
+            $seen.Add($key)
+        }
+        $result.Add($v)
+    }
+    return , $result
+}
+
+# 戻り値: @(lo, hi)（scale 単位の整数）
+function Get-NumBounds($schema, [long]$Scale) {
+    $mn = ConvertTo-Dec (Get-OaProp $schema 'minimum')
+    $mx = ConvertTo-Dec (Get-OaProp $schema 'maximum')
+    $exmin = Get-OaProp $schema 'exclusiveMinimum'
+    $exmax = Get-OaProp $schema 'exclusiveMaximum'
+    $exLo = (($exmin -is [bool]) -and $exmin)
+    $exHi = (($exmax -is [bool]) -and $exmax)
+    if (Test-Num $exmin) {
+        $e = ConvertTo-Dec $exmin
+        if (($null -eq $mn) -or ($e -ge $mn)) { $mn = $e; $exLo = $true }
+    }
+    if (Test-Num $exmax) {
+        $e = ConvertTo-Dec $exmax
+        if (($null -eq $mx) -or ($e -le $mx)) { $mx = $e; $exHi = $true }
+    }
+    $vlim = [decimal](Get-FloorDiv $script:UNITS_LIMIT $Scale)
+    $lo = $null
+    $hi = $null
+    if ($null -ne $mn) {
+        $v = (Limit-DecTo $mn $vlim) * [decimal]$Scale
+        $lo = [long][decimal]::Ceiling($v)
+        if ($exLo -and ([decimal]$lo -eq $v)) { $lo = $lo + 1L }
+    }
+    if ($null -ne $mx) {
+        $v = (Limit-DecTo $mx $vlim) * [decimal]$Scale
+        $hi = [long][decimal]::Floor($v)
+        if ($exHi -and ([decimal]$hi -eq $v)) { $hi = $hi - 1L }
+    }
+    $one = $Scale
+    if (($null -eq $lo) -and ($null -eq $hi)) {
+        $lo = $one
+        $hi = 100L * $one
+    } elseif ($null -eq $hi) {
+        $hi = $lo + 99L * $one
+    } elseif ($null -eq $lo) {
+        if ($hi -ge $one) { $lo = $one } else { $lo = $hi - 99L * $one }
+    }
+    if ($lo -gt $hi) { $hi = $lo }
+    return @([long]$lo, [long]$hi)
+}
+
+function New-GenInteger($schema) {
+    $b = Get-NumBounds $schema 1L
+    $lo = [long]$b[0]
+    $hi = [long]$b[1]
+    $fmt = Get-OaProp $schema 'format'
+    if ((Test-Str $fmt) -and ($fmt -ceq 'int32')) {
+        if ($lo -lt -2147483648L) { $lo = -2147483648L }
+        if ($hi -gt 2147483647L) { $hi = 2147483647L }
+        if ($lo -gt $hi) { $hi = $lo }
+    }
+    $m = ConvertTo-Dec (Get-OaProp $schema 'multipleOf')
+    if (($null -ne $m) -and ($m -gt 0) -and ([decimal]::Truncate($m) -eq $m)) {
+        $mi = [long]$m
+        $kmin = Get-CeilDiv $lo $mi
+        $kmax = Get-FloorDiv $hi $mi
+        if ($kmin -le $kmax) { return [JNum]::new(((Get-Between $kmin $kmax) * $mi).ToString($script:Inv)) }
+        return [JNum]::new($lo.ToString($script:Inv))
+    }
+    return [JNum]::new((Get-Between $lo $hi).ToString($script:Inv))
+}
+
+function Get-DecimalsOf([decimal]$d) {
+    $s = Format-Dec $d
+    $i = $s.IndexOf('.')
+    if ($i -ge 0) { return $s.Substring($i + 1).TrimEnd([char]'0').Length }
+    return 0
+}
+
+function Format-Units([long]$Units, [int]$D) {
+    $neg = ($Units -lt 0)
+    if ($neg) { $a = -$Units } else { $a = $Units }
+    if ($D -eq 0) {
+        $s = $a.ToString($script:Inv)
+    } else {
+        $p = Get-Pow10 $D
+        $rem = 0L
+        $q = [System.Math]::DivRem([long]$a, [long]$p, [ref]$rem)
+        $s = ([long]$q).ToString($script:Inv) + '.' + ([long]$rem).ToString($script:Inv).PadLeft($D, [char]'0')
+    }
+    if ($neg) { return '-' + $s }
+    return $s
+}
+
+function New-GenNumber($schema) {
+    $m = ConvertTo-Dec (Get-OaProp $schema 'multipleOf')
+    if (($null -ne $m) -and ($m -le 0)) { $m = $null }
+    if ($null -ne $m) { $d = Get-DecimalsOf $m } else { $d = 2 }
+    if ($d -gt $script:MAX_DECIMALS) { $d = $script:MAX_DECIMALS }
+    $scale = Get-Pow10 $d
+    $b = Get-NumBounds $schema $scale
+    $lo = [long]$b[0]
+    $hi = [long]$b[1]
+    $units = $null
+    if ($null -ne $m) {
+        $mu = $m * [decimal]$scale
+        if (($mu -gt 0) -and ([decimal]::Truncate($mu) -eq $mu)) {
+            $mi = [long]$mu
+            $kmin = Get-CeilDiv $lo $mi
+            $kmax = Get-FloorDiv $hi $mi
+            if ($kmin -le $kmax) { $units = (Get-Between $kmin $kmax) * $mi } else { $units = $lo }
+        }
+    }
+    if ($null -eq $units) { $units = Get-Between $lo $hi }
+    return [JNum]::new((Format-Units ([long]$units) $d))
+}
+
+function Get-RandStr([string]$Pool, [long]$N) {
+    $sb = New-Object System.Text.StringBuilder
+    for ($i = 0; $i -lt $N; $i++) {
+        [void]$sb.Append($Pool[[int](Get-Between 0 ($Pool.Length - 1))])
+    }
+    return $sb.ToString()
+}
+
+function Get-ChooseLen($minL, $maxL) {
+    $lo = 0L
+    if ($null -ne $minL) { $lo = [long]$minL }
+    if ($lo -lt 8) { $lo = 8L }
+    if (($null -ne $maxL) -and ($lo -gt $maxL)) { $lo = [long]$maxL }
+    if ($null -eq $maxL) {
+        $hi = [System.Math]::Max($lo, 16L)
+    } else {
+        $hi = [System.Math]::Min([long]$maxL, [System.Math]::Max($lo, 16L))
+    }
+    if ($hi -lt $lo) { $hi = $lo }
+    return (Get-Between $lo $hi)
+}
+
+function Get-UtcFromEpoch([long]$Secs) {
+    return ([datetime]::new(1970, 1, 1, 0, 0, 0, [System.DateTimeKind]::Utc)).AddSeconds([double]$Secs)
+}
+
+function New-GenString($schema) {
+    $fmt = Get-OaProp $schema 'format'
+    if (-not (Test-Str $fmt)) { $fmt = '' }
+    $minL = Get-IntOrNull (Get-OaProp $schema 'minLength')
+    $maxL = Get-IntOrNull (Get-OaProp $schema 'maxLength')
+    $pattern = Get-OaProp $schema 'pattern'
+    if ((Test-Str $pattern) -and ($pattern.Length -gt 0)) {
+        $s = New-FromPattern $pattern $minL $maxL
+        if ($null -ne $s) { return $s }
+    }
+    switch -CaseSensitive ($fmt) {
+        'date-time' {
+            return (Get-UtcFromEpoch (Get-Between $script:EPOCH_START $script:EPOCH_END)).ToString("yyyy'-'MM'-'dd'T'HH':'mm':'ss'Z'", $script:Inv)
+        }
+        'date' {
+            $days = Get-Between ([long][System.Math]::Floor($script:EPOCH_START / 86400)) ([long][System.Math]::Floor($script:EPOCH_END / 86400))
+            return (Get-UtcFromEpoch ($days * 86400L)).ToString("yyyy'-'MM'-'dd", $script:Inv)
+        }
+        'time' {
+            $secs = Get-Between 0 86399
+            $hh = Get-FloorDiv $secs 3600
+            $mm = Get-FloorDiv ($secs % 3600L) 60
+            $ss = $secs % 60L
+            return ('{0}:{1}:{2}' -f ([long]$hh).ToString('00', $script:Inv), ([long]$mm).ToString('00', $script:Inv), ([long]$ss).ToString('00', $script:Inv))
+        }
+        'email' { return (Get-RandStr $script:LOWER_ALNUM 8) + '@example.com' }
+        'uuid' {
+            $sb = New-Object System.Text.StringBuilder
+            for ($i = 0; $i -lt 32; $i++) {
+                if ($i -eq 12) { [void]$sb.Append('4') }
+                elseif ($i -eq 16) { [void]$sb.Append($script:HEXD[[int](8 + (Get-Between 0 3))]) }
+                else { [void]$sb.Append($script:HEXD[[int](Get-Between 0 15)]) }
+            }
+            $u = $sb.ToString()
+            return $u.Substring(0, 8) + '-' + $u.Substring(8, 4) + '-' + $u.Substring(12, 4) + '-' + $u.Substring(16, 4) + '-' + $u.Substring(20, 12)
+        }
+        'uri' { return 'https://example.com/' + (Get-RandStr $script:LOWER_ALNUM 8) }
+        'url' { return 'https://example.com/' + (Get-RandStr $script:LOWER_ALNUM 8) }
+        'uri-reference' { return 'https://example.com/' + (Get-RandStr $script:LOWER_ALNUM 8) }
+        'iri' { return 'https://example.com/' + (Get-RandStr $script:LOWER_ALNUM 8) }
+        'iri-reference' { return 'https://example.com/' + (Get-RandStr $script:LOWER_ALNUM 8) }
+        'hostname' { return (Get-RandStr $script:LOWER_ALNUM 8) + '.example.com' }
+        'idn-hostname' { return (Get-RandStr $script:LOWER_ALNUM 8) + '.example.com' }
+        'ipv4' { return '192.0.2.' + (Get-Between 1 254).ToString($script:Inv) }
+        'ipv6' { return '2001:db8::' + (Get-Between 1 65535).ToString('x') }
+        'byte' {
+            $raw = New-Object byte[] 12
+            for ($i = 0; $i -lt 12; $i++) { $raw[$i] = [byte](Get-Between 0 255) }
+            return [System.Convert]::ToBase64String($raw)
+        }
+        'password' { return (Get-RandStr $script:ALNUM 12) }
+        'binary' { return (Get-RandStr $script:ALNUM 16) }
+    }
+    return (Get-RandStr $script:ALNUM (Get-ChooseLen $minL $maxL))
+}
+
+# ----------------------------------------------------------------- pattern（正規表現）から文字列を生成
+function New-CodeRange([int]$a, [int]$b) {
+    $l = New-Object 'System.Collections.Generic.List[int]'
+    for ($c = $a; $c -le $b; $c++) { $l.Add($c) }
+    return , $l
+}
+
+function New-SortedCodes($list) {
+    $set = New-Object 'System.Collections.Generic.HashSet[int]'
+    foreach ($c in $list) { [void]$set.Add([int]$c) }
+    $l = New-Object 'System.Collections.Generic.List[int]' (, [int[]]@($set))
+    $l.Sort()
+    return , ($l.ToArray())
+}
+
+$script:DIGIT_SET = (New-CodeRange 0x30 0x39).ToArray()
+$script:UPPER_SET = (New-CodeRange 0x41 0x5A).ToArray()
+$script:LOWER_SET = (New-CodeRange 0x61 0x7A).ToArray()
+$script:ALNUM_SET = [int[]]($script:DIGIT_SET + $script:UPPER_SET + $script:LOWER_SET)
+$script:WORD_SET = New-SortedCodes ([int[]]($script:ALNUM_SET + @(0x5F)))
+$script:NONDIGIT_SET = [int[]]($script:UPPER_SET + $script:LOWER_SET)
+$script:NONWORD_SET = [int[]]@(0x2D, 0x2E)
+$script:SPACE_SET = [int[]]@(0x20)
+$script:NEG_BASE = New-SortedCodes ([int[]]($script:ALNUM_SET + @(0x2D, 0x2E, 0x5F)))
+$script:PRINTABLE_SET = (New-CodeRange 0x21 0x7E).ToArray()
+
+function Test-ValidCode([int]$c) {
+    return (($c -eq 9) -or ($c -eq 10) -or ($c -eq 13) -or (($c -ge 0x20) -and ($c -le 0xD7FF)) -or (($c -ge 0xE000) -and ($c -le 0xFFFD)) -or (($c -ge 0x10000) -and ($c -le 0x10FFFF)))
+}
+
+# パターン文字列はコードポイント単位の配列で扱う（Python の str と同じ単位）
+$script:PP = $null
+$script:PI = 0
+
+function Stop-Pattern([string]$m) {
+    $ex = New-Object System.FormatException($m)
+    $ex.Data['PATTERN'] = $true
+    throw $ex
+}
+
+function Get-PPeek([int]$k = 0) {
+    $j = $script:PI + $k
+    if ($j -lt $script:PP.Count) { return $script:PP[$j] }
+    return $null
+}
+
+function Get-PTake {
+    $ch = $script:PP[$script:PI]
+    $script:PI++
+    return $ch
+}
+
+function New-PNode([string]$T) { return @{ T = $T } }
+
+function Read-PAlt {
+    $options = New-Object 'System.Collections.Generic.List[object]'
+    $options.Add((Read-PSeq))
+    while ((Get-PPeek) -ceq '|') {
+        [void](Get-PTake)
+        $options.Add((Read-PSeq))
+    }
+    if ($options.Count -eq 1) { return $options[0] }
+    $n = New-PNode 'alt'
+    $n.Items = $options
+    return $n
+}
+
+function Read-PSeq {
+    $items = New-Object 'System.Collections.Generic.List[object]'
+    while ($true) {
+        $ch = Get-PPeek
+        if (($null -eq $ch) -or ($ch -ceq '|') -or ($ch -ceq ')')) { break }
+        $items.Add((Read-PQuant (Read-PAtom)))
+    }
+    $n = New-PNode 'seq'
+    $n.Items = $items
+    return $n
+}
+
+function Get-EmptySeq {
+    $n = New-PNode 'seq'
+    $n.Items = New-Object 'System.Collections.Generic.List[object]'
+    return $n
+}
+
+function New-PLit([int]$c) { $n = New-PNode 'lit'; $n.C = $c; return $n }
+function New-PSet($pool) { $n = New-PNode 'set'; $n.Pool = [int[]]$pool; return $n }
+
+function Read-PAtom {
+    $ch = Get-PTake
+    if ($ch -ceq '(') {
+        if ((Get-PPeek) -ceq '?') {
+            [void](Get-PTake)
+            $c2 = Get-PPeek
+            if ($c2 -ceq ':') { [void](Get-PTake) }
+            elseif (($c2 -ceq 'P') -and ((Get-PPeek 1) -ceq '<')) { Skip-PGroupName 2 }
+            elseif (($c2 -ceq '<') -and ($null -ne (Get-PPeek 1)) -and ((Get-PPeek 1) -cne '=') -and ((Get-PPeek 1) -cne '!')) { Skip-PGroupName 1 }
+            else { Stop-Pattern 'unsupported group' }
+        }
+        $node = Read-PAlt
+        if ((Get-PPeek) -cne ')') { Stop-Pattern 'unbalanced' }
+        [void](Get-PTake)
+        return $node
+    }
+    if ($ch -ceq '[') { return (Read-PClass) }
+    if ($ch -ceq '.') { return (New-PSet $script:ALNUM_SET) }
+    if (($ch -ceq '^') -or ($ch -ceq '$')) { return (Get-EmptySeq) }
+    if ($ch -ceq '\') { return (Read-PEscape $false) }
+    if (($ch -ceq '*') -or ($ch -ceq '+') -or ($ch -ceq '?') -or ($ch -ceq ')')) { Stop-Pattern 'quantifier without target' }
+    return (New-PLit ([char]::ConvertToUtf32($ch, 0)))
+}
+
+function Skip-PGroupName([int]$k) {
+    for ($i = 0; $i -lt $k; $i++) { [void](Get-PTake) }
+    while ($true) {
+        $c = Get-PPeek
+        if ($null -eq $c) { Stop-Pattern 'bad group name' }
+        [void](Get-PTake)
+        if ($c -ceq '>') { return }
+    }
+}
+
+function Read-PHex([int]$Count) {
+    $sb = New-Object System.Text.StringBuilder
+    for ($i = 0; $i -lt $Count; $i++) {
+        $c = Get-PPeek $i
+        if ($null -eq $c) { Stop-Pattern 'bad hex escape' }
+        [void]$sb.Append($c)
+    }
+    $s = $sb.ToString()
+    if (-not ($s -cmatch '^[0-9A-Fa-f]+$')) { Stop-Pattern 'bad hex escape' }
+    $script:PI += $Count
+    return [System.Convert]::ToInt32($s, 16)
+}
+
+function Read-PEscape([bool]$InClass) {
+    if ($script:PI -ge $script:PP.Count) { Stop-Pattern 'trailing backslash' }
+    $ch = Get-PTake
+    switch -CaseSensitive ($ch) {
+        'd' { return (New-PSet $script:DIGIT_SET) }
+        'D' { return (New-PSet $script:NONDIGIT_SET) }
+        'w' { return (New-PSet $script:WORD_SET) }
+        'W' { return (New-PSet $script:NONWORD_SET) }
+        's' { return (New-PSet $script:SPACE_SET) }
+        'S' { return (New-PSet $script:ALNUM_SET) }
+        't' { return (New-PLit 9) }
+        'n' { return (New-PLit 10) }
+        'r' { return (New-PLit 13) }
+        'u' {
+            $c = Read-PHex 4
+            if (-not (Test-ValidCode $c)) { Stop-Pattern 'bad code point' }
+            return (New-PLit $c)
+        }
+        'x' {
+            $c = Read-PHex 2
+            if (-not (Test-ValidCode $c)) { Stop-Pattern 'bad code point' }
+            return (New-PLit $c)
+        }
+    }
+    if (@('b', 'B', 'A', 'z', 'Z', 'G') -ccontains $ch) {
+        if ($InClass) { Stop-Pattern 'unsupported escape in class' }
+        return (Get-EmptySeq)
+    }
+    if ('0123456789'.Contains($ch) -or (@('p', 'P', 'k', 'c', 'f', 'v', 'e', 'a', 'Q', 'E') -ccontains $ch)) { Stop-Pattern 'unsupported escape' }
+    return (New-PLit ([char]::ConvertToUtf32($ch, 0)))
+}
+
+function Read-PClassItem {
+    $ch = Get-PTake
+    if ($ch -ceq '\') { return (Read-PEscape $true) }
+    if (($ch -ceq '[') -and ((Get-PPeek) -ceq ':')) { Stop-Pattern 'posix class' }
+    return (New-PLit ([char]::ConvertToUtf32($ch, 0)))
+}
+
+function Read-PClass {
+    $negate = $false
+    if ((Get-PPeek) -ceq '^') { [void](Get-PTake); $negate = $true }
+    $codes = New-Object 'System.Collections.Generic.HashSet[int]'
+    $first = $true
+    while ($true) {
+        if ($script:PI -ge $script:PP.Count) { Stop-Pattern 'unterminated class' }
+        if (((Get-PPeek) -ceq ']') -and -not $first) { [void](Get-PTake); break }
+        $first = $false
+        $item = Read-PClassItem
+        if (($item.T -ceq 'lit') -and ((Get-PPeek) -ceq '-') -and ($null -ne (Get-PPeek 1)) -and ((Get-PPeek 1) -cne ']')) {
+            [void](Get-PTake)
+            $item2 = Read-PClassItem
+            if ($item2.T -cne 'lit') { Stop-Pattern 'bad range' }
+            $a = [int]$item.C
+            $b = [int]$item2.C
+            if (($a -gt $b) -or (($b - $a) -gt 70000)) { Stop-Pattern 'bad range' }
+            for ($c = $a; $c -le $b; $c++) { [void]$codes.Add($c) }
+        } elseif ($item.T -ceq 'lit') {
+            [void]$codes.Add([int]$item.C)
+        } elseif ($item.T -ceq 'set') {
+            foreach ($c in $item.Pool) { [void]$codes.Add([int]$c) }
+        } else {
+            Stop-Pattern 'bad class item'
+        }
+    }
+    $pool = New-Object 'System.Collections.Generic.List[int]'
+    if ($negate) {
+        foreach ($c in $script:NEG_BASE) { if (-not $codes.Contains($c)) { $pool.Add($c) } }
+        if ($pool.Count -eq 0) {
+            foreach ($c in $script:PRINTABLE_SET) { if (-not $codes.Contains($c)) { $pool.Add($c) } }
+        }
+    } else {
+        foreach ($c in $codes) { $pool.Add($c) }
+        $pool.Sort()
+    }
+    $valid = New-Object 'System.Collections.Generic.List[int]'
+    foreach ($c in $pool) { if (Test-ValidCode $c) { $valid.Add($c) } }
+    if ($valid.Count -eq 0) { Stop-Pattern 'empty class' }
+    return (New-PSet $valid.ToArray())
+}
+
+function Read-PQuant($node) {
+    while ($true) {
+        $ch = Get-PPeek
+        if ($ch -ceq '*') { [void](Get-PTake); $mn = 0; $mx = -1 }
+        elseif ($ch -ceq '+') { [void](Get-PTake); $mn = 1; $mx = -1 }
+        elseif ($ch -ceq '?') { [void](Get-PTake); $mn = 0; $mx = 1 }
+        elseif ($ch -ceq '{') {
+            $sb = New-Object System.Text.StringBuilder
+            for ($j = $script:PI; $j -lt $script:PP.Count; $j++) { [void]$sb.Append($script:PP[$j]) }
+            $m = [regex]::Match($sb.ToString(), '^\{([0-9]+)(,([0-9]*))?\}')
+            if (-not $m.Success) { return $node }
+            $script:PI += $m.Value.Length
+            $mn = [int]::Parse($m.Groups[1].Value, $script:Inv)
+            if (-not $m.Groups[2].Success) { $mx = $mn }
+            elseif ($m.Groups[3].Value -ceq '') { $mx = -1 }
+            else { $mx = [int]::Parse($m.Groups[3].Value, $script:Inv) }
+            if ((($mx -ne -1) -and ($mx -lt $mn)) -or ($mn -gt 1000)) { Stop-Pattern 'bad quantifier' }
+        } else {
+            return $node
+        }
+        if (((Get-PPeek) -ceq '?') -or ((Get-PPeek) -ceq '+')) { [void](Get-PTake) }
+        $r = New-PNode 'rep'
+        $r.Node = $node
+        $r.Min = $mn
+        $r.Max = $mx
+        $node = $r
+    }
+}
+
+function Write-PNode($node, [System.Text.StringBuilder]$Out) {
+    switch -CaseSensitive ($node.T) {
+        'lit' { [void]$Out.Append((ConvertFrom-CodePoint $node.C)) }
+        'set' {
+            $pool = $node.Pool
+            [void]$Out.Append((ConvertFrom-CodePoint $pool[[int](Get-Between 0 ($pool.Length - 1))]))
+        }
+        'seq' { foreach ($x in $node.Items) { Write-PNode $x $Out } }
+        'alt' {
+            $opts = $node.Items
+            Write-PNode $opts[[int](Get-Between 0 ($opts.Count - 1))] $Out
+        }
+        'rep' {
+            $mn = [long]$node.Min
+            $mx = [long]$node.Max
+            if ($mx -eq -1) { $mx = $mn + 5 }
+            $cap = [System.Math]::Max($mn, 16L)
+            if ($mx -gt $cap) { $mx = $cap }
+            $k = Get-Between $mn $mx
+            for ($i = 0; $i -lt $k; $i++) { Write-PNode $node.Node $Out }
+        }
+    }
+}
+
+function ConvertTo-CodePointList([string]$s) {
+    $l = New-Object 'System.Collections.Generic.List[string]'
+    $i = 0
+    while ($i -lt $s.Length) {
+        if ([char]::IsHighSurrogate($s[$i]) -and ($i + 1 -lt $s.Length) -and [char]::IsLowSurrogate($s[$i + 1])) {
+            $l.Add($s.Substring($i, 2))
+            $i += 2
+        } else {
+            $l.Add([string]$s[$i])
+            $i++
+        }
+    }
+    return , $l
+}
+
+function New-FromPattern([string]$Pattern, $minL, $maxL) {
+    $script:PP = ConvertTo-CodePointList $Pattern
+    $script:PI = 0
+    try {
+        $ast = Read-PAlt
+        if ($script:PI -ne $script:PP.Count) { Stop-Pattern 'unexpected' }
+    } catch {
+        if ($_.Exception.Data.Contains('PATTERN')) {
+            Add-Warn ('pattern を解釈できないためランダム英数字で代用しました: ' + $Pattern)
+            return $null
+        }
+        throw
+    }
+    $rx = $null
+    try { $rx = New-Object System.Text.RegularExpressions.Regex($Pattern) } catch { $rx = $null }
+    $last = $null
+    for ($attempt = 0; $attempt -lt 10; $attempt++) {
+        $sb = New-Object System.Text.StringBuilder
+        Write-PNode $ast $sb
+        $s = $sb.ToString()
+        $last = $s
+        if (($null -ne $rx) -and -not $rx.IsMatch($s)) { continue }
+        if (($null -ne $minL) -and ((Get-CpLen $s) -lt $minL)) { continue }
+        if (($null -ne $maxL) -and ((Get-CpLen $s) -gt $maxL)) { continue }
+        return $s
+    }
+    if (($null -ne $last) -and (($null -eq $rx) -or $rx.IsMatch($last))) { return $last }
+    Add-Warn ('pattern に一致する値を生成できないためランダム英数字で代用しました: ' + $Pattern)
+    return $null
+}
+
+# ----------------------------------------------------------------- パラメータ
+$script:METHOD_KEYS = @('get', 'put', 'post', 'delete', 'options', 'head', 'patch', 'trace')
+$script:ANY_KEY = 'x-amazon-apigateway-any-method'
+$script:SKIP_HEADERS = @('accept', 'content-type', 'authorization')
+$script:MANAGED_HEADERS = @('content-length', 'host', 'transfer-encoding', 'connection')
+
+function Get-Params($item, $op) {
+    $table = New-Object System.Collections.Specialized.OrderedDictionary
+    foreach ($src in @((Get-OaProp $item 'parameters'), (Get-OaProp $op 'parameters'))) {
+        if (-not (Test-Arr $src)) { continue }
+        foreach ($p in $src) {
+            $rp = Resolve-Deref $p 'parameter'
+            if (-not (Test-Obj $rp)) { continue }
+            $name = Get-OaProp $rp 'name'
+            $loc = Get-OaProp $rp 'in'
+            if (-not (Test-Str $name) -or -not (Test-Str $loc) -or ($name.Length -eq 0)) { continue }
+            $table[$loc + "`n" + $name] = $rp
+        }
+    }
+    $list = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($v in $table.Values) { $list.Add($v) }
+    return , $list
+}
+
+function Get-FirstValue($d) {
+    foreach ($k in @($d.Keys)) { return , ($d[$k]) }
+    return $null
+}
+
+function Get-ParamValue($p) {
+    if ($script:OptUseExamples) {
+        if (Test-Has $p 'example') { return , (ConvertTo-GenValue $p['example']) }
+        $exs = Get-OaProp $p 'examples'
+        if ((Test-Obj $exs) -and ($exs.Count -gt 0)) {
+            $first = Resolve-Deref (Get-FirstValue $exs) 'example'
+            if ((Test-Obj $first) -and (Test-Has $first 'value')) { return , (ConvertTo-GenValue $first['value']) }
+        }
+    }
+    $schema = Get-OaProp $p 'schema'
+    if ($null -eq $schema) {
+        $content = Get-OaProp $p 'content'
+        if ((Test-Obj $content) -and ($content.Count -gt 0)) { $schema = Get-OaProp (Get-FirstValue $content) 'schema' }
+    }
+    if ($null -eq $schema) {
+        $schema = New-OMap
+        $schema['type'] = 'string'
+    }
+    $empty = New-Object 'System.Collections.Generic.List[string]'
+    $v = New-Gen $schema 0 $empty
+    if (Test-Skip $v) { $v = '' }
+    return , $v
+}
+
+function Get-SimpleStyle($v, [bool]$Explode) {
+    $parts = New-Object 'System.Collections.Generic.List[string]'
+    if (Test-Arr $v) {
+        foreach ($x in $v) { $parts.Add((Get-ScalarStr $x)) }
+        return [string]::Join(',', $parts)
+    }
+    if (Test-Obj $v) {
+        foreach ($k in @($v.Keys)) {
+            if ($Explode) { $parts.Add([string]$k + '=' + (Get-ScalarStr $v[$k])) }
+            else { $parts.Add([string]$k + ',' + (Get-ScalarStr $v[$k])) }
+        }
+        return [string]::Join(',', $parts)
+    }
+    return (Get-ScalarStr $v)
+}
+
+function New-Pair([string]$Name, [string]$Value) { return , @($Name, $Value) }
+
+function Get-QueryPairs([string]$Name, $v, [string]$Style, [bool]$Explode) {
+    $pairs = New-Object 'System.Collections.Generic.List[object]'
+    if (Test-Arr $v) {
+        if (($Style -ceq 'form') -and $Explode) {
+            foreach ($x in $v) { $pairs.Add((New-Pair $Name (Get-ScalarStr $x))) }
+            return , $pairs
+        }
+        if ($Style -ceq 'spaceDelimited') { $sep = ' ' } elseif ($Style -ceq 'pipeDelimited') { $sep = '|' } else { $sep = ',' }
+        $parts = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($x in $v) { $parts.Add((Get-ScalarStr $x)) }
+        $pairs.Add((New-Pair $Name ([string]::Join($sep, $parts))))
+        return , $pairs
+    }
+    if (Test-Obj $v) {
+        if ($Style -ceq 'deepObject') {
+            foreach ($k in @($v.Keys)) { $pairs.Add((New-Pair ($Name + '[' + [string]$k + ']') (Get-ScalarStr $v[$k]))) }
+            return , $pairs
+        }
+        if ($Explode) {
+            foreach ($k in @($v.Keys)) { $pairs.Add((New-Pair ([string]$k) (Get-ScalarStr $v[$k]))) }
+            return , $pairs
+        }
+        $parts = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($k in @($v.Keys)) { $parts.Add([string]$k + ',' + (Get-ScalarStr $v[$k])) }
+        $pairs.Add((New-Pair $Name ([string]::Join(',', $parts))))
+        return , $pairs
+    }
+    $pairs.Add((New-Pair $Name (Get-ScalarStr $v)))
+    return , $pairs
+}
+
+# ----------------------------------------------------------------- リクエストボディ
+function Get-MediaBase([string]$mt) { return $mt.Split([char]';', 2)[0].Trim().ToLowerInvariant() }
+
+function Select-Media($keys) {
+    # JSON 系 → フォーム → マルチパート の順に優先し、どれも無ければ定義の先頭のメディアタイプを使う
+    for ($pi = 0; $pi -lt 5; $pi++) {
+        foreach ($k in $keys) {
+            $b = Get-MediaBase $k
+            $hit = $false
+            switch ($pi) {
+                0 { $hit = ($b -ceq 'application/json') }
+                1 { $hit = $b.EndsWith('+json', [System.StringComparison]::Ordinal) }
+                2 { $hit = $b.Contains('json') }
+                3 { $hit = ($b -ceq 'application/x-www-form-urlencoded') }
+                4 { $hit = ($b -ceq 'multipart/form-data') }
+            }
+            if ($hit) { return $k }
+        }
+    }
+    return $keys[0]
+}
+
+function Get-MediaKind([string]$mt) {
+    $b = Get-MediaBase $mt
+    if (($b -ceq 'application/json') -or $b.EndsWith('+json', [System.StringComparison]::Ordinal) -or $b.Contains('json') -or ($b -ceq '*/*') -or ($b -ceq 'application/*')) { return 'json' }
+    if ($b -ceq 'application/x-www-form-urlencoded') { return 'form' }
+    if ($b.StartsWith('multipart/', [System.StringComparison]::Ordinal)) { return 'multipart' }
+    if ($b.EndsWith('/xml', [System.StringComparison]::Ordinal) -or $b.EndsWith('+xml', [System.StringComparison]::Ordinal)) { return 'xml' }
+    if ($b.StartsWith('text/', [System.StringComparison]::Ordinal)) { return 'text' }
+    return 'binary'
+}
+
+function Get-ContentTypeFor([string]$mt, [string]$Kind) {
+    if ((Get-MediaBase $mt).Contains('*')) {
+        switch -CaseSensitive ($Kind) {
+            'json' { return 'application/json' }
+            'xml' { return 'application/xml' }
+            'text' { return 'text/plain' }
+        }
+        return 'application/octet-stream'
+    }
+    return $mt.Trim()
+}
+
+function Get-XmlName([string]$n) {
+    $n = [regex]::Replace($n, '[^A-Za-z0-9_.-]', '_')
+    if (($n.Length -eq 0) -or -not ($n -cmatch '^[A-Za-z_]')) { $n = '_' + $n }
+    return $n
+}
+
+function Get-XmlText([string]$s) {
+    return (Get-CleanText $s).Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
+}
+
+function ConvertTo-XmlText($v, [string]$Name, [int]$Indent) {
+    $pad = '  ' * $Indent
+    if (Test-Obj $v) {
+        if ($v.Count -eq 0) { return $pad + '<' + $Name + '/>' }
+        $lines = New-Object 'System.Collections.Generic.List[string]'
+        $lines.Add($pad + '<' + $Name + '>')
+        foreach ($k in @($v.Keys)) {
+            $kn = Get-XmlName ([string]$k)
+            $x = $v[$k]
+            if (Test-Arr $x) {
+                foreach ($it in $x) { $lines.Add((ConvertTo-XmlText $it $kn ($Indent + 1))) }
+            } else {
+                $lines.Add((ConvertTo-XmlText $x $kn ($Indent + 1)))
+            }
+        }
+        $lines.Add($pad + '</' + $Name + '>')
+        return [string]::Join("`n", $lines)
+    }
+    if (Test-Arr $v) {
+        if ($v.Count -eq 0) { return $pad + '<' + $Name + '/>' }
+        $lines = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($it in $v) { $lines.Add((ConvertTo-XmlText $it $Name $Indent)) }
+        return [string]::Join("`n", $lines)
+    }
+    return $pad + '<' + $Name + '>' + (Get-XmlText (Get-ScalarStr $v)) + '</' + $Name + '>'
+}
+
+function Get-XmlRootName($schema) {
+    $s = $schema
+    $name = $null
+    $guard = 0
+    while ((Test-Obj $s) -and (Test-Has $s '$ref') -and ($guard -lt 32)) {
+        $ref = $s['$ref']
+        if (Test-Str $ref) {
+            $segs = $ref.Split([char]'/')
+            $name = $segs[$segs.Length - 1]
+        }
+        $s = Resolve-Ref $ref
+        $guard++
+    }
+    $x = Get-OaProp $s 'xml'
+    if ((Test-Obj $x) -and (Test-Str (Get-OaProp $x 'name')) -and ($x['name'].Length -gt 0)) { $name = $x['name'] }
+    if ([string]::IsNullOrEmpty($name)) { $name = 'root' }
+    return (Get-XmlName $name)
+}
+
+function New-Body($op) {
+    if (-not (Test-Has $op 'requestBody')) { return $null }
+    $rb = Resolve-Deref $op['requestBody'] 'requestBody'
+    $content = Get-OaProp $rb 'content'
+    if (-not (Test-Obj $content) -or ($content.Count -eq 0)) { return $null }
+    $keys = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($k in @($content.Keys)) { $keys.Add([string]$k) }
+    $mt = Select-Media $keys
+    $media = $content[$mt]
+    $schema = Get-OaProp $media 'schema'
+    $kind = Get-MediaKind $mt
+    $have = $false
+    $value = $null
+    if ($script:OptUseExamples -and (Test-Obj $media)) {
+        if (Test-Has $media 'example') {
+            $value = ConvertTo-GenValue $media['example']
+            $have = $true
+        } else {
+            $exs = Get-OaProp $media 'examples'
+            if ((Test-Obj $exs) -and ($exs.Count -gt 0)) {
+                $first = Resolve-Deref (Get-FirstValue $exs) 'example'
+                if ((Test-Obj $first) -and (Test-Has $first 'value')) {
+                    $value = ConvertTo-GenValue $first['value']
+                    $have = $true
+                }
+            }
+        }
+    }
+    if (-not $have) {
+        if ($null -eq $schema) {
+            if (@('json', 'form', 'multipart', 'xml') -ccontains $kind) { $value = New-OMap } else { $value = Get-RandStr $script:ALNUM 16 }
+        } else {
+            $empty = New-Object 'System.Collections.Generic.List[string]'
+            $value = New-Gen $schema 0 $empty
+            if (Test-Skip $value) { $value = New-OMap }
+        }
+    }
+    $ctype = Get-ContentTypeFor $mt $kind
+    $pairs = New-Object 'System.Collections.Generic.List[object]'
+    if ($kind -ceq 'json') {
+        return @{ Kind = $kind; CType = $ctype; Text = (ConvertTo-JsonText $value 0 $true); Pairs = $pairs }
+    }
+    if (($kind -ceq 'form') -or ($kind -ceq 'multipart')) {
+        if (Test-Obj $value) {
+            foreach ($k in @($value.Keys)) {
+                $x = $value[$k]
+                if (Test-Arr $x) {
+                    foreach ($it in $x) { $pairs.Add((New-Pair ([string]$k) (Get-ScalarStr $it))) }
+                } else {
+                    $pairs.Add((New-Pair ([string]$k) (Get-ScalarStr $x)))
+                }
+            }
+        } else {
+            $pairs.Add((New-Pair 'value' (Get-ScalarStr $value)))
+        }
+        return @{ Kind = $kind; CType = $ctype; Text = ''; Pairs = $pairs }
+    }
+    if ($kind -ceq 'xml') {
+        $text = '<?xml version="1.0" encoding="UTF-8"?>' + "`n" + (ConvertTo-XmlText $value (Get-XmlRootName $schema) 0)
+        return @{ Kind = $kind; CType = $ctype; Text = $text; Pairs = $pairs }
+    }
+    if ($value -is [string]) { $text = $value } else { $text = ConvertTo-JsonText $value 0 $true }
+    return @{ Kind = $kind; CType = $ctype; Text = $text; Pairs = $pairs }
+}
+
+# ----------------------------------------------------------------- レスポンス（Accept・期待ステータス）
+function Test-Is2xx([string]$k) { return (($k -cmatch '^2[0-9][0-9]$') -or ($k -ceq '2XX')) }
+
+function Get-Accept($op) {
+    $responses = Get-OaProp $op 'responses'
+    if (-not (Test-Obj $responses)) { return $null }
+    foreach ($k in @($responses.Keys)) {
+        if (-not (Test-Is2xx (([string]$k).Trim().ToUpperInvariant()))) { continue }
+        $r = Resolve-Deref $responses[$k] 'response'
+        $content = Get-OaProp $r 'content'
+        if ((Test-Obj $content) -and ($content.Count -gt 0)) {
+            $mt = [string](@($content.Keys)[0])
+            if ($mt.Contains('*')) { return $null }
+            return $mt.Trim()
+        }
+    }
+    return $null
+}
+
+function Get-SuccessCodes($op) {
+    $responses = Get-OaProp $op 'responses'
+    $codes = New-Object 'System.Collections.Generic.List[string]'
+    $hasRange = $false
+    if (Test-Obj $responses) {
+        foreach ($k in @($responses.Keys)) {
+            $ks = ([string]$k).Trim().ToUpperInvariant()
+            if ($ks -cmatch '^2[0-9][0-9]$') {
+                if (-not $codes.Contains($ks)) { $codes.Add($ks) }
+            } elseif ($ks -ceq '2XX') {
+                $hasRange = $true
+            }
+        }
+    }
+    return @{ Codes = $codes; HasRange = $hasRange }
+}
+
+# ----------------------------------------------------------------- セキュリティ
+function Get-EffectiveSecurity($op) {
+    if (Test-Has $op 'security') { return , ($op['security']) }
+    return , (Get-OaProp $script:Doc 'security')
+}
+
+function Get-SecurityText($op) {
+    $sec = Get-EffectiveSecurity $op
+    if (-not (Test-Arr $sec)) { return $null }
+    if ($sec.Count -eq 0) { return 'なし（認証不要）' }
+    $alts = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($req in $sec) {
+        if (-not (Test-Obj $req)) { continue }
+        if ($req.Count -eq 0) { $alts.Add('認証なしも可'); continue }
+        $parts = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($nk in @($req.Keys)) {
+            $scopes = $req[$nk]
+            $sc = New-Object 'System.Collections.Generic.List[string]'
+            if (Test-Arr $scopes) { foreach ($x in $scopes) { if (Test-Str $x) { $sc.Add($x) } } }
+            if ($sc.Count -gt 0) { $parts.Add([string]$nk + '[' + [string]::Join(', ', $sc) + ']') } else { $parts.Add([string]$nk) }
+        }
+        $alts.Add([string]::Join(' かつ ', $parts))
+    }
+    if ($alts.Count -eq 0) { return $null }
+    return [string]::Join(' または ', $alts)
+}
+
+function Test-SchemeUsesAuthorization($scheme) {
+    if (-not (Test-Obj $scheme)) { return $false }
+    $t = Get-OaProp $scheme 'type'
+    if (-not (Test-Str $t)) { return $false }
+    if (($t -ceq 'oauth2') -or ($t -ceq 'openIdConnect') -or ($t -ceq 'http')) { return $true }
+    if ($t -ceq 'apiKey') {
+        $in = Get-OaProp $scheme 'in'
+        $nm = Get-OaProp $scheme 'name'
+        return ((Test-Str $in) -and ($in -ceq 'header') -and (Test-Str $nm) -and ($nm.ToLowerInvariant() -ceq 'authorization'))
+    }
+    return $false
+}
+
+function Test-NeedsAuthHeader($ops) {
+    $schemes = Get-OaProp (Get-OaProp $script:Doc 'components') 'securitySchemes'
+    foreach ($info in $ops) {
+        $sec = Get-EffectiveSecurity $info.Op
+        if (-not (Test-Arr $sec)) { continue }
+        foreach ($req in $sec) {
+            if (-not (Test-Obj $req)) { continue }
+            foreach ($nk in @($req.Keys)) {
+                $sch = Resolve-Deref (Get-OaProp $schemes ([string]$nk)) 'securityScheme'
+                if (Test-SchemeUsesAuthorization $sch) { return $true }
+            }
+        }
+    }
+    return $false
+}
+
+# ----------------------------------------------------------------- オペレーション
+function Get-Operations {
+    $ops = New-Object 'System.Collections.Generic.List[object]'
+    $paths = Get-OaProp $script:Doc 'paths'
+    foreach ($pk in @($paths.Keys)) {
+        $path = [string]$pk
+        if ($path.StartsWith('x-', [System.StringComparison]::Ordinal)) { continue }
+        $item = Resolve-Deref $paths[$pk] 'pathItem'
+        if (-not (Test-Obj $item)) { continue }
+        foreach ($kk in @($item.Keys)) {
+            $key = [string]$kk
+            $k = $key.ToLowerInvariant()
+            if ($script:METHOD_KEYS -ccontains $k) {
+                $method = $k.ToUpperInvariant()
+                $isAny = $false
+            } elseif ($k -ceq $script:ANY_KEY) {
+                $method = $script:OptAnyMethod
+                $isAny = $true
+            } else {
+                continue
+            }
+            $op = $item[$kk]
+            if (-not (Test-Obj $op)) { continue }
+            $ops.Add(@{ Path = $path; Item = $item; Op = $op; Key = $key; Method = $method; IsAny = $isAny })
+        }
+    }
+    return , $ops
+}
+
+$script:PLACEHOLDER_RE = New-Object System.Text.RegularExpressions.Regex('\{([^{}]+)\}')
+
+function New-OperationRequest($info, [string]$Label) {
+    $path = $info.Path
+    $op = $info.Op
+    $method = $info.Method
+    $params = Get-Params $info.Item $op
+
+    # 1. パスパラメータ
+    $pathVals = New-Object System.Collections.Specialized.OrderedDictionary
+    foreach ($p in $params) {
+        if ((Get-OaProp $p 'in') -ceq 'path') {
+            $ex = Get-OaProp $p 'explode'
+            $pathVals[[string]$p['name']] = @{ V = (Get-ParamValue $p); Explode = (($ex -is [bool]) -and $ex) }
+        }
+    }
+    foreach ($m in $script:PLACEHOLDER_RE.Matches($path)) {
+        $ph = $m.Groups[1].Value
+        if ($ph.EndsWith('+', [System.StringComparison]::Ordinal)) { $base = $ph.Substring(0, $ph.Length - 1) } else { $base = $ph }
+        if (-not $pathVals.Contains($base)) {
+            Add-Warn ('{0}: パス変数 {{{1}}} のパラメータ定義が無いため英数字 8 文字を仮設定しました' -f $Label, $base)
+            $pathVals[$base] = @{ V = (Get-RandStr $script:ALNUM 8); Explode = $false }
+        }
+    }
+    $sb = New-Object System.Text.StringBuilder
+    $pos = 0
+    foreach ($m in $script:PLACEHOLDER_RE.Matches($path)) {
+        [void]$sb.Append($path.Substring($pos, $m.Index - $pos))
+        $ph = $m.Groups[1].Value
+        $greedy = $ph.EndsWith('+', [System.StringComparison]::Ordinal)
+        if ($greedy) { $base = $ph.Substring(0, $ph.Length - 1) } else { $base = $ph }
+        $pv = $pathVals[$base]
+        [void]$sb.Append((Get-PctEncode (Get-SimpleStyle $pv.V $pv.Explode) $greedy))
+        $pos = $m.Index + $m.Length
+    }
+    [void]$sb.Append($path.Substring($pos))
+    $realPath = $sb.ToString()
+    if (-not $realPath.StartsWith('/', [System.StringComparison]::Ordinal)) { $realPath = '/' + $realPath }
+
+    # 2. クエリパラメータ
+    $qpairs = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($p in $params) {
+        if ((Get-OaProp $p 'in') -cne 'query') { continue }
+        $rq = Get-OaProp $p 'required'
+        if ($script:OptRequiredOnly -and -not (($rq -is [bool]) -and $rq)) { continue }
+        $v = Get-ParamValue $p
+        $style = Get-OaProp $p 'style'
+        if (-not (Test-Str $style)) { $style = 'form' }
+        $explode = Get-OaProp $p 'explode'
+        if (-not ($explode -is [bool])) { $explode = ($style -ceq 'form') }
+        foreach ($pair in (Get-QueryPairs ([string]$p['name']) $v $style $explode)) { $qpairs.Add($pair) }
+    }
+
+    # 3. ヘッダパラメータ
+    $hparams = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($p in $params) {
+        if ((Get-OaProp $p 'in') -cne 'header') { continue }
+        $name = [string]$p['name']
+        $lname = $name.ToLowerInvariant()
+        if ($script:SKIP_HEADERS -ccontains $lname) { continue }
+        if ($lname -ceq 'x-api-key') {
+            Add-Warn ('{0}: ヘッダ {1} は API キーの実値が必要なため生成しません（設定 common_headers に「{1}: キーの値」を指定してください）' -f $Label, $name)
+            continue
+        }
+        if ($script:MANAGED_HEADERS -ccontains $lname) {
+            Add-Warn ('{0}: ヘッダ {1} は HTTP クライアントが自動設定するため生成しません' -f $Label, $name)
+            continue
+        }
+        $rq = Get-OaProp $p 'required'
+        if ($script:OptRequiredOnly -and -not (($rq -is [bool]) -and $rq)) { continue }
+        $v = Get-ParamValue $p
+        $ex = Get-OaProp $p 'explode'
+        $hparams.Add((New-Pair $name (Get-HeaderSafe (Get-SimpleStyle $v (($ex -is [bool]) -and $ex)))))
+    }
+
+    # 4. クッキーパラメータ
+    $cookies = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($p in $params) {
+        if ((Get-OaProp $p 'in') -cne 'cookie') { continue }
+        $rq = Get-OaProp $p 'required'
+        if ($script:OptRequiredOnly -and -not (($rq -is [bool]) -and $rq)) { continue }
+        $v = Get-ParamValue $p
+        $cookies.Add([string]$p['name'] + '=' + (Get-PctEncode (Get-SimpleStyle $v $false) $false))
+    }
+
+    # 5. リクエストボディ
+    $body = New-Body $op
+
+    # 6. 組み立て（API一覧（Excel / CSV）の 1 行と同じ項目を返す。クエリを Parameters に入れるか URL に
+    #    付けるかは、Excel / CSV の行と同じく Normalize-Api がメソッドで決める）
+    $bodyType = ''
+    $bodyText = ''
+    $headers = New-Object 'System.Collections.Generic.List[object]'
+    if ($null -ne $body) {
+        if (($body.Kind -ceq 'form') -or ($body.Kind -ceq 'multipart')) {
+            $bodyType = $body.Kind
+            $bodyText = Get-OaRowPairs $body.Pairs
+            if ($body.Kind -ceq 'form') { $headers.Add((New-Pair 'Content-Type' $body.CType)) }
+        } else {
+            if ($body.Kind -ceq 'json') { $bodyType = 'json' } else { $bodyType = 'raw' }
+            $bodyText = $body.Text
+            $headers.Add((New-Pair 'Content-Type' $body.CType))
+        }
+    }
+    $accept = Get-Accept $op
+    if ($null -ne $accept) { $headers.Add((New-Pair 'Accept' $accept)) }
+    foreach ($h in $hparams) { $headers.Add($h) }
+    if ($cookies.Count -gt 0) { $headers.Add((New-Pair 'Cookie' ([string]::Join('; ', $cookies)))) }
+
+    $sc = Get-SuccessCodes $op
+    $hasData = ($pathVals.Count -gt 0) -or ($qpairs.Count -gt 0) -or ($hparams.Count -gt 0) -or ($cookies.Count -gt 0) -or ($null -ne $body)
+    $comment = Get-OperationComment $info $body $hasData
+    if ($sc.HasRange -and ($sc.Codes.Count -eq 0)) {
+        $comment += "`n" + '※ 成功レスポンスが 2XX（範囲指定）のため期待ステータスは空欄です（JMeter の既定の判定: 2xx / 3xx = 成功）。'
+    }
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($h in $headers) { $lines.Add([string]$h[0] + ': ' + [string]$h[1]) }
+    return @{
+        method = $method; url = $realPath; query = (Get-OaRowPairs $qpairs); headers = [string]::Join("`n", $lines)
+        body_type = $bodyType; body = $bodyText; expected_status = [string]::Join(',', $sc.Codes); comment = $comment
+    }
+}
+
+function Get-OperationComment($info, $body, [bool]$HasData) {
+    $op = $info.Op
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    $summary = Get-OaProp $op 'summary'
+    if ((Test-Str $summary) -and ($summary.Trim().Length -gt 0)) { $lines.Add('概要: ' + $summary.Trim()) }
+    $desc = Get-OaProp $op 'description'
+    if ((Test-Str $desc) -and ($desc.Trim().Length -gt 0)) { $lines.Add('説明: ' + $desc.Trim()) }
+    $lines.Add('OpenAPI 定義: ' + $info.Key + ' ' + $info.Path)
+    $opId = Get-OaProp $op 'operationId'
+    if ((Test-Str $opId) -and ($opId.Length -gt 0)) { $lines.Add('operationId: ' + $opId) }
+    if ($info.IsAny) {
+        $lines.Add('ANY メソッド（x-amazon-apigateway-any-method）のため ' + $info.Method + ' で代表して送信します（生成時の --any-method / -AnyMethod で変更可）。')
+    }
+    $sec = Get-SecurityText $op
+    if ($null -ne $sec) { $lines.Add('認可（security）: ' + $sec) }
+    $integ = Get-OaProp $op 'x-amazon-apigateway-integration'
+    if (Test-Obj $integ) {
+        $items = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($k in @('type', 'httpMethod', 'uri', 'connectionType')) {
+            $iv = Get-OaProp $integ $k
+            if (Test-Str $iv) { $items.Add($k + '=' + $iv) }
+        }
+        if ($items.Count -gt 0) { $lines.Add('API Gateway 統合: ' + [string]::Join(', ', $items)) }
+    }
+    $dep = Get-OaProp $op 'deprecated'
+    if (($dep -is [bool]) -and $dep) { $lines.Add('※ deprecated（非推奨）に指定された API です。') }
+    if (($null -ne $body) -and ($body.Kind -ceq 'multipart')) {
+        $lines.Add('※ multipart/form-data はファイル項目もテキスト値で送信します。実ファイルを送る場合は「ファイルアップロード」タブで設定してください。')
+    }
+    if ($HasData) {
+        $lines.Add('テストデータ: OpenAPI のデータ型定義からランダム生成（乱数シード ' + $script:SeedValue.ToString($script:Inv) + '）')
+    }
+    return [string]::Join("`n", $lines)
+}
+
+# ----------------------------------------------------------------- JSON 読み込み
+function ConvertFrom-JssValue($v) {
+    if ($null -eq $v) { return $null }
+    if ($v -is [System.Collections.Generic.Dictionary[string, object]]) {
+        $d = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::Ordinal)
+        foreach ($k in @($v.Keys)) { $d[$k] = (ConvertFrom-JssValue $v[$k]) }
+        return , $d
+    }
+    if (($v -is [object[]]) -or ($v -is [System.Collections.ArrayList])) {
+        $l = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($i in $v) { $l.Add((ConvertFrom-JssValue $i)) }
+        return , $l
+    }
+    if ($v -is [int]) { return [long]$v }
+    if ($v -is [double]) {
+        return [decimal]::Parse($v.ToString('R', $script:Inv), [System.Globalization.NumberStyles]::Float, $script:Inv)
+    }
+    return $v
+}
+
+function ConvertFrom-JsonElementValue($el) {
+    switch ([string]$el.ValueKind) {
+        'Object' {
+            $d = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::Ordinal)
+            foreach ($p in $el.EnumerateObject()) { $d[$p.Name] = (ConvertFrom-JsonElementValue $p.Value) }
+            return , $d
+        }
+        'Array' {
+            $l = New-Object 'System.Collections.Generic.List[object]'
+            foreach ($i in $el.EnumerateArray()) { $l.Add((ConvertFrom-JsonElementValue $i)) }
+            return , $l
+        }
+        'String' { return $el.GetString() }
+        'Number' {
+            $raw = $el.GetRawText()
+            if ($raw -cmatch '^-?[0-9]+$') {
+                $lv = 0L
+                if ([long]::TryParse($raw, [System.Globalization.NumberStyles]::AllowLeadingSign, $script:Inv, [ref]$lv)) { return $lv }
+            }
+            return [decimal]::Parse($raw, [System.Globalization.NumberStyles]::Float, $script:Inv)
+        }
+        'True' { return $true }
+        'False' { return $false }
+    }
+    return $null
+}
+
+# JSON 文字列（エスケープ込み）と ${...} を先頭から順に拾う。文字列は読み飛ばし、${...} だけを置き換える。
+# 直後が : の ${...} はキーの位置なので置き換えない（5.1 の JavaScriptSerializer は引用符なしのキーを
+# 受け付けてしまい、実装間で結果が変わるため。置き換えなければどの実装でも構文エラーになる）
+$script:PlaceholderScan = New-Object System.Text.RegularExpressions.Regex('"[^"\\]*(?:\\.[^"\\]*)*"|\$\{[^{}"\r\n]+\}(?![ \t\r\n]*:)', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+$script:PlaceholderLinesShown = 10
+$script:PlaceholderCount = 0
+
+function Resolve-Placeholders([string]$Text, [string]$Value) {
+    # JSON 文字列の外に引用符なしで書かれた ${...}（後で置換するプレースホルダ）を数値 $Value に置き換える。
+    # 文字列の中の ${...}（"${stageVariables.x}" など）は正しい JSON なので変更しない。
+    # 戻り値: @{ Text = 置換後の文字列; Names = プレースホルダ（初出順）; Lines = プレースホルダ → 行番号の一覧 }
+    $names = New-Object 'System.Collections.Generic.List[string]'
+    $lines = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::Ordinal)
+    if ($Text.IndexOf('${', [System.StringComparison]::Ordinal) -lt 0) { return @{ Text = $Text; Names = $names; Lines = $lines } }
+    $sb = New-Object System.Text.StringBuilder
+    $pos = 0
+    $line = 1L
+    foreach ($m in $script:PlaceholderScan.Matches($Text)) {
+        $s = $m.Index
+        if ($Text[$s] -cne [char]'$') { continue }    # 文字列（読み飛ばすだけ）
+        $j = $Text.IndexOf([char]10, $pos)
+        while (($j -ge 0) -and ($j -lt $s)) { $line++; $j = $Text.IndexOf([char]10, $j + 1) }
+        [void]$sb.Append($Text, $pos, $s - $pos)
+        [void]$sb.Append($Value)
+        if (-not $lines.ContainsKey($m.Value)) {
+            $names.Add($m.Value)
+            $lines[$m.Value] = New-Object 'System.Collections.Generic.List[long]'
+        }
+        $lines[$m.Value].Add($line)
+        $pos = $s + $m.Length
+    }
+    [void]$sb.Append($Text, $pos, $Text.Length - $pos)
+    return @{ Text = $sb.ToString(); Names = $names; Lines = $lines }
+}
+
+function Get-PlaceholderWarning([string]$Name, $Lines, [string]$Value) {
+    $shown = New-Object 'System.Collections.Generic.List[string]'
+    for ($i = 0; ($i -lt $Lines.Count) -and ($i -lt $script:PlaceholderLinesShown); $i++) { $shown.Add($Lines[$i].ToString($script:Inv)) }
+    if ($Lines.Count -gt $script:PlaceholderLinesShown) { $more = ' ほか' } else { $more = '' }
+    return ('引用符なしのプレースホルダ ' + $Name + ' は JSON として読めないため、数値 ' + $Value + ' に置き換えて読み込みました（' +
+        $Lines.Count.ToString($script:Inv) + ' 箇所・行 ' + [string]::Join(', ', $shown) + $more + '）')
+}
+
+function Read-JsonFile([string]$Path, [string]$PlaceholderValue) {
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $strict = New-Object System.Text.UTF8Encoding($false, $true)
+    try {
+        if (($bytes.Length -ge 3) -and ($bytes[0] -eq 0xEF) -and ($bytes[1] -eq 0xBB) -and ($bytes[2] -eq 0xBF)) {
+            $text = $strict.GetString($bytes, 3, $bytes.Length - 3)
+        } elseif (($bytes.Length -ge 2) -and ($bytes[0] -eq 0xFF) -and ($bytes[1] -eq 0xFE)) {
+            $text = [System.Text.Encoding]::Unicode.GetString($bytes, 2, $bytes.Length - 2)
+        } elseif (($bytes.Length -ge 2) -and ($bytes[0] -eq 0xFE) -and ($bytes[1] -eq 0xFF)) {
+            $text = [System.Text.Encoding]::BigEndianUnicode.GetString($bytes, 2, $bytes.Length - 2)
+        } else {
+            $text = $strict.GetString($bytes)
+        }
+    } catch {
+        Stop-Gen ('入力ファイルの文字コードを UTF-8 として読めません: ' + $Path)
+    }
+    $ph = Resolve-Placeholders $text $PlaceholderValue
+    $text = $ph.Text
+    try {
+        if ($PSVersionTable.PSEdition -eq 'Core') {
+            $opts = New-Object System.Text.Json.JsonDocumentOptions
+            $opts.MaxDepth = 1024
+            $jd = [System.Text.Json.JsonDocument]::Parse($text, $opts)
+            try { $doc = ConvertFrom-JsonElementValue $jd.RootElement } finally { $jd.Dispose() }
+        } else {
+            Add-Type -AssemblyName System.Web.Extensions
+            $jss = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+            $jss.MaxJsonLength = [int]::MaxValue
+            $jss.RecursionLimit = 1024
+            $doc = ConvertFrom-JssValue ($jss.DeserializeObject($text))
+        }
+    } catch {
+        if ($_.Exception.Data.Contains('OA2J')) { throw }
+        Stop-Gen ('JSON の構文エラーです（YAML 形式は未対応です）: ' + $_.Exception.Message)
+    }
+    foreach ($nm in $ph.Names) { Add-Warn (Get-PlaceholderWarning $nm $ph.Lines[$nm] $PlaceholderValue) }
+    $script:PlaceholderCount = $ph.Names.Count
+    return , $doc
+}
+
+function Get-OaRowPairs($pairs) {
+    # (名前, 値) の並びを API一覧の「名前=値」（改行区切り）の形にする。
+    # 区切り文字（& 改行 =）・%・$・前後の空白を含むものは、名前・値とも URL エンコードして書く
+    $out = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($pr in $pairs) {
+        $k = [string]$pr[0]
+        $v = [string]$pr[1]
+        if (($k -ceq $k.Trim()) -and ($v -ceq $v.Trim()) -and -not $k.Contains('=') -and -not [regex]::IsMatch($k + $v, '[&%$\x00-\x1F\x7F]')) {
+            $out.Add($k + '=' + $v)
+            continue
+        }
+        $ek = Get-PctEncode $k $false
+        $ev = Get-PctEncode $v $false
+        if (-not $ev.Contains('%')) {
+            # 値に %XX が無いと JMeter がエンコード済みの名前をもう一度エンコードするため、値もすべて %XX にする
+            $sb = New-Object System.Text.StringBuilder
+            foreach ($b in [System.Text.Encoding]::UTF8.GetBytes($ev)) { [void]$sb.Append('%').Append(([int]$b).ToString('X2', $script:Inv)) }
+            $ev = $sb.ToString()
+        }
+        $out.Add($ek + '=' + $ev)
+    }
+    return [string]::Join("`n", $out)
+}
+
+function Get-OaServerUrl($doc) {
+    # 接続先の既定値: servers[0].url（{変数} は既定値に置換）。http(s) の URL でなければ http://localhost:8080 を前に付ける
+    $servers = Get-OaProp $doc 'servers'
+    $srv = $null
+    if ((Test-Arr $servers) -and ($servers.Count -gt 0) -and (Test-Obj $servers[0])) { $srv = $servers[0] }
+    $url = Get-OaProp $srv 'url'
+    if (Test-Str $url) { $url = $url.Trim() } else { $url = '' }
+    $vars = Get-OaProp $srv 'variables'
+    $sb = New-Object System.Text.StringBuilder
+    $pos = 0
+    foreach ($m in $script:PLACEHOLDER_RE.Matches($url)) {
+        [void]$sb.Append($url.Substring($pos, $m.Index - $pos))
+        $d = Get-OaProp (Get-OaProp $vars $m.Groups[1].Value) 'default'
+        if (Test-Str $d) { [void]$sb.Append($d) } else { [void]$sb.Append($m.Value) }
+        $pos = $m.Index + $m.Length
+    }
+    [void]$sb.Append($url.Substring($pos))
+    $url = $sb.ToString().TrimEnd([char]'/')
+    if ($url -cmatch '^[Hh][Tt][Tt][Pp][Ss]?://') { return $url }
+    if (($url.Length -gt 0) -and -not $url.StartsWith('/', [System.StringComparison]::Ordinal)) { $url = '/' + $url }
+    return 'http://localhost:8080' + $url
+}
+
+function Load-OpenApi([string]$inputPath) {
+    # OpenAPI 3.0.x 定義（JSON）を読み込み、API一覧（Excel / CSV）と同じ項目の行に変換する
+    # 戻り値: @(行の一覧, OpenAPI 定義から求めた設定の既定値 @(@(設定キー, 値), ...))
+    if ($Seed.Length -gt 0) {
+        if (-not ($Seed -cmatch '^[0-9]{1,12}\z')) { throw (New-ToolError ('-Seed は 0 以上の整数（12 桁以内）で指定してください: ' + $Seed)) }
+        $script:SeedValue = [long]::Parse($Seed, $script:Inv)
+    } else {
+        $buf = New-Object byte[] 4
+        $rngc = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+        try { $rngc.GetBytes($buf) } finally { $rngc.Dispose() }
+        $script:SeedValue = (([long]$buf[0] * 16777216L) + ([long]$buf[1] * 65536L) + ([long]$buf[2] * 256L) + [long]$buf[3]) % 1000000000L
+    }
+    $anyM = $AnyMethod.ToUpperInvariant()
+    if (-not (@('GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS') -ccontains $anyM)) { throw (New-ToolError ('-AnyMethod は GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS のいずれかです: ' + $AnyMethod)) }
+    if (-not ($PlaceholderValue -cmatch '^-?(0|[1-9][0-9]{0,14})([.][0-9]{1,12})?\z')) { throw (New-ToolError ('-PlaceholderValue は JSON の数値（例: 3000、-1、2.5。整数部 15 桁・小数部 12 桁以内）で指定してください: ' + $PlaceholderValue)) }
+    $script:OptRequiredOnly = [bool]$RequiredOnly
+    $script:OptUseExamples = [bool]$UseExamples
+    $script:OptAnyMethod = $anyM
+    $doc = Read-JsonFile (FullPath $inputPath) $PlaceholderValue
+    if (-not (Test-Obj $doc)) { Stop-Gen 'OpenAPI 定義のルートが JSON オブジェクトではありません' }
+    $script:Doc = $doc
+    if (Test-Has $doc 'swagger') { Stop-Gen 'Swagger 2.0 形式には対応していません。OpenAPI 3.0.x 形式（"openapi": "3.0.3" など）に変換してください' }
+    $ver = Get-OaProp $doc 'openapi'
+    if (-not (Test-Str $ver) -or -not ($ver -cmatch '^3\.[0-9]+(\.[0-9]+)?')) { Stop-Gen '"openapi" フィールドが 3.x ではありません（OpenAPI 3.0.x の JSON を指定してください）' }
+    if (-not $ver.StartsWith('3.0', [System.StringComparison]::Ordinal)) { Write-Warn ('OpenAPI ' + $ver + ' は 3.0.x 以外です。3.0.x と共通の項目のみを解釈します。') }
+    if (-not (Test-Obj (Get-OaProp $doc 'paths'))) { Stop-Gen '"paths" が定義されていません' }
+    $infoObj = Get-OaProp $doc 'info'
+    $title = Get-OaProp $infoObj 'title'
+    if ((Test-Str $title) -and ($title.Trim().Length -gt 0)) { $title = $title.Trim() } else { $title = 'OpenAPI' }
+    $apiVersion = Get-OaProp $infoObj 'version'
+    if ((Test-Str $apiVersion) -and ($apiVersion.Trim().Length -gt 0)) { $apiVersion = $apiVersion.Trim() } else { $apiVersion = '-' }
+
+    Initialize-Rng $script:SeedValue
+    $ops = Get-Operations
+    if ($ops.Count -eq 0) { Stop-Gen '"paths" に呼び出し可能な操作（get/post/put/delete など）が 1 件もありません' }
+    $records = New-Object System.Collections.Generic.List[object]
+    for ($idx = 0; $idx -lt $ops.Count; $idx++) {
+        $io = $ops[$idx]
+        if ($io.IsAny) { $name = 'ANY(' + $io.Method + ')' } else { $name = $io.Method }
+        $name = $name + ' ' + $io.Path
+        $opId = Get-OaProp $io.Op 'operationId'
+        if ((Test-Str $opId) -and ($opId.Length -gt 0)) { $name += ' [' + $opId + ']' }
+        $row = New-OperationRequest $io ('API' + ($idx + 1).ToString('00', $script:Inv) + '_' + $name)
+        $row['no'] = ($idx + 1).ToString($script:Inv)
+        $row['enabled'] = 'Y'
+        $row['name'] = $name
+        $rec = @{ _row = ($idx + 1) }
+        foreach ($c in $script:Spec.api_columns) {
+            $v = ''
+            if ($row.ContainsKey($c.key)) { $v = [string]$row[$c.key] }
+            $rec[$c.key] = (Clean $v).Trim()
+        }
+        $records.Add($rec)
+    }
+    if (Test-NeedsAuthHeader $ops) {
+        Add-Warn '認可（security）が定義された API があります。Authorization ヘッダが必要な場合は、設定 common_headers に指定してください（例: Authorization: Bearer ${AUTH_TOKEN}）'
+    }
+    foreach ($w in $script:OaWarnings) { Write-Warn $w }
+    Write-Info ('API定義: OpenAPI ' + $ver + '（' + $title + ' ' + $apiVersion + '、' + $records.Count + ' 件）')
+    Write-Info ('テストデータの乱数シード: ' + $script:SeedValue + '（-Seed ' + $script:SeedValue + ' を指定すると同じテストデータを再生成できます）')
+    $defaults = @(@('base_url', (Get-OaServerUrl $doc)), @('output_file', ((Get-SafeName $title) + '.jmx')),
+        @('test_plan_name', ($title + ' ' + $apiVersion + '（OpenAPI ' + $ver + '）')))
+    return @($records, $defaults)
+}
+
 # ----------------------------------------------------------------------------- input loading
 function Get-Aliases {
     $m = New-Object 'System.Collections.Generic.Dictionary[string,string]'
@@ -3069,6 +4899,7 @@ function Rows-FromCsv($table) {
 function Load-Input([string]$inputPath, [string]$settingsPath) {
     $ext = [System.IO.Path]::GetExtension($inputPath).ToLowerInvariant()
     $raw = $null
+    $oaDefaults = @()
     $base = [System.IO.Path]::GetFileName($inputPath)
     if ($ext -ceq '.xlsx' -or $ext -ceq '.xlsm') {
         $sheets = Read-Xlsx $inputPath
@@ -3099,10 +4930,19 @@ function Load-Input([string]$inputPath, [string]$settingsPath) {
             if (Test-Path -LiteralPath $cand -PathType Leaf) { $settingsPath = $cand }
             else { Write-Warn ('設定 CSV（' + [System.IO.Path]::GetFileName($cand) + '）が無いため、設定はすべて既定値を使用します') }
         }
+    } elseif ($ext -ceq '.json') {
+        $oa = Load-OpenApi $inputPath
+        $records = $oa[0]
+        $oaDefaults = $oa[1]
+        if (-not $settingsPath) {
+            $cand = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($inputPath), [System.IO.Path]::GetFileNameWithoutExtension($inputPath) + '_settings.csv')
+            if (Test-Path -LiteralPath $cand -PathType Leaf) { $settingsPath = $cand }
+            else { Write-Info ('設定 CSV（' + [System.IO.Path]::GetFileName($cand) + '）が無いため既定値を使用します（接続先などは OpenAPI 定義の値）') }
+        }
     } elseif ($ext -ceq '.xls') {
         throw (New-ToolError ('.xls 形式（Excel 97-2003）には対応していません。Excel で .xlsx 形式で保存し直してください: ' + $inputPath))
     } else {
-        throw (New-ToolError ('対応していないファイル形式です（.xlsx / .csv）: ' + $inputPath))
+        throw (New-ToolError ('対応していないファイル形式です（.xlsx / .csv / .json）: ' + $inputPath))
     }
     if ($settingsPath) {
         if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) { throw (New-ToolError ('設定ファイルが見つかりません: ' + $settingsPath)) }
@@ -3119,6 +4959,12 @@ function Load-Input([string]$inputPath, [string]$settingsPath) {
         Write-Info ('設定: ' + $settingsPath)
     }
     if ($null -eq $raw) { $raw = New-Object 'System.Collections.Generic.Dictionary[string,string]' }
+    foreach ($d in $oaDefaults) {
+        if (-not $raw.ContainsKey($d[0]) -or -not $raw[$d[0]]) {
+            $raw[$d[0]] = [string]$d[1]
+            Write-Info ('設定 ' + $d[0] + ': ' + $d[1] + '（設定ファイルで未指定のため OpenAPI 定義から設定）')
+        }
+    }
     return @($raw, $records)
 }
 function Parse-Bool([string]$v) {
@@ -3362,7 +5208,7 @@ function Normalize-Api($rec, [int]$index, $cfg) {
     $body = [string]$rec['body']
     $bt = ([string]$rec['body_type']).ToLowerInvariant()
     if (-not $bt) { $bt = 'auto' }
-    if (-not (@('auto', 'json', 'form', 'raw', 'xml') -ccontains $bt)) {
+    if (-not (@('auto', 'json', 'form', 'raw', 'xml', 'multipart') -ccontains $bt)) {
         Write-Warn ($where + ': ボディ形式「' + $rec['body_type'] + '」は auto / json / form / raw のいずれかで記入してください（auto として扱います）')
         $bt = 'auto'
     }
@@ -3382,7 +5228,7 @@ function Normalize-Api($rec, [int]$index, $cfg) {
             $kind = $bt
         }
     }
-    if ($kind -ceq 'form') {
+    if ($kind -ceq 'form' -or $kind -ceq 'multipart') {
         $args2 = New-Object System.Collections.Generic.List[object]
         foreach ($x in (Split-Pairs $body)) { $args2.Add(@($x[0], $x[1], (Needs-Encode $x[1]))) }
     }
@@ -3571,7 +5417,7 @@ function Api-Node($api, $cfg) {
     foreach ($x in @((PStr 'HTTPSampler.domain' $dom), (PStr 'HTTPSampler.port' $prt), (PStr 'HTTPSampler.protocol' $pro),
             (PStr 'HTTPSampler.contentEncoding' $cfg['content_encoding']), (PStr 'HTTPSampler.path' $api.path), (PStr 'HTTPSampler.method' $api.method),
             (PBool 'HTTPSampler.follow_redirects' $cfg['follow_redirects']), (PBool 'HTTPSampler.auto_redirects' $false),
-            (PBool 'HTTPSampler.use_keepalive' $cfg['keep_alive']), (PBool 'HTTPSampler.DO_MULTIPART_POST' $false),
+            (PBool 'HTTPSampler.use_keepalive' $cfg['keep_alive']), (PBool 'HTTPSampler.DO_MULTIPART_POST' ($api.kind -ceq 'multipart')),
             (PStr 'HTTPSampler.embedded_url_re' ''), (PStr 'HTTPSampler.connect_timeout' ''), (PStr 'HTTPSampler.response_timeout' ''))) { $props.Add($x) }
     $comment = Fill $CM.sampler @{ ID = $aid; METHOD = $api.method; URL = $api.url }
     if ($api.comment) { $comment += "`n" + $api.comment }
@@ -4112,13 +5958,19 @@ jmeter_api_tool.ps1 - REST API の JMeter テスト（JMX）生成・実行ツ�
   jmeter_api_tool.bat init     [-OutDir フォルダ] [-Force]
       入力テンプレート（api_definition.xlsx / .csv / _settings.csv）を作成します（既定: input）
 
-  jmeter_api_tool.bat generate -InputFile 入力ファイル [-SettingsFile 設定CSV] [-OutDir フォルダ] [-Split] [-Force]
-      Excel（.xlsx）または CSV の API 定義から JMX を生成します（既定: output）
-        -InputFile（-i）     入力ファイル（.xlsx / .csv）
+  jmeter_api_tool.bat generate -InputFile 入力ファイル [-SettingsFile 設定CSV] [-OutDir フォルダ] [-Split] [-Force] [OpenAPI用オプション]
+      Excel（.xlsx）・CSV・OpenAPI 定義（.json）の API 定義から JMX を生成します（既定: output）
+        -InputFile（-i）     入力ファイル（.xlsx / .csv / .json）
         -SettingsFile（-s）  設定 CSV（省略時は「入力ファイル名_settings.csv」→ 既定値）
         -OutDir（-o）        出力先フォルダ
         -Split               API ごとに別々の JMX を出力
         -Force（-f）         サンプルデータ（data\testdata.*）を上書き
+      OpenAPI 定義（.json）用のオプション:
+        -Seed N              テストデータの乱数シード（同じ値なら同じデータ。既定: 毎回ランダム）
+        -AnyMethod M         x-amazon-apigateway-any-method（ANY）で送るメソッド（既定: GET）
+        -RequiredOnly        必須（required）のパラメータ・プロパティだけを生成
+        -UseExamples         example / default があればランダム値より優先
+        -PlaceholderValue N  値の位置に引用符なしで書かれた ${...} に仮に入れる数値（既定: 3000）
 
   jmeter_api_tool.bat manual   [-OutDir フォルダ]
       利用方法（JMeter_Usage_Guide.xlsx / .md）を出力します（既定: docs）
@@ -4142,6 +5994,7 @@ jmeter_api_tool.ps1 - REST API の JMeter テスト（JMX）生成・実行ツ�
 例:
   jmeter_api_tool.bat init
   jmeter_api_tool.bat generate -i input\api_definition.xlsx
+  jmeter_api_tool.bat generate -i openapi.json -Seed 12345
   jmeter_api_tool.bat run -t output\api_test.jmx -Threads 10 -Loops 100
 '@
 }

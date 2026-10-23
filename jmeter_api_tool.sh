@@ -2,7 +2,7 @@
 # =============================================================================
 #  jmeter_api_tool.sh  v1.0.0   （RHEL 9.8 用 / bash + python3 標準ライブラリ）
 #
-#  REST API の定義（Excel / CSV）から Apache JMeter 5.6.3 用の JMX を生成し、
+#  REST API の定義（Excel / CSV / OpenAPI）から Apache JMeter 5.6.3 用の JMX を生成し、
 #  CLI モードで実行して JTL・HTML レポート・ログを出力するツールです。
 #
 #  使い方（詳細は ./jmeter_api_tool.sh help）:
@@ -38,13 +38,19 @@ jmeter_api_tool.sh - REST API の JMeter テスト（JMX）生成・実行ツー
   ./jmeter_api_tool.sh init     [-o フォルダ] [-f]
       入力テンプレート（api_definition.xlsx / .csv / _settings.csv）を作成します（既定: input）
 
-  ./jmeter_api_tool.sh generate -i 入力ファイル [-s 設定CSV] [-o フォルダ] [--split] [-f]
-      Excel（.xlsx）または CSV の API 定義から JMX を生成します（既定: output）
-        -i FILE    入力ファイル（.xlsx / .csv）
+  ./jmeter_api_tool.sh generate -i 入力ファイル [-s 設定CSV] [-o フォルダ] [--split] [-f] [OpenAPI用オプション]
+      Excel（.xlsx）・CSV・OpenAPI 定義（.json）の API 定義から JMX を生成します（既定: output）
+        -i FILE    入力ファイル（.xlsx / .csv / .json）
         -s FILE    設定 CSV（省略時は「入力ファイル名_settings.csv」→ 既定値）
         -o DIR     出力先フォルダ
         --split    API ごとに別々の JMX を出力
         -f         サンプルデータ（data/testdata.*）を上書き
+      OpenAPI 定義（.json）用のオプション:
+        --seed N               テストデータの乱数シード（同じ値なら同じデータ。既定: 毎回ランダム）
+        --any-method M         x-amazon-apigateway-any-method（ANY）で送るメソッド（既定: GET）
+        --required-only        必須（required）のパラメータ・プロパティだけを生成
+        --use-examples         example / default があればランダム値より優先
+        --placeholder-value N  値の位置に引用符なしで書かれた ${...} に仮に入れる数値（既定: 3000）
 
   ./jmeter_api_tool.sh manual   [-o フォルダ]
       利用方法（JMeter_Usage_Guide.xlsx / .md）を出力します（既定: docs）
@@ -66,6 +72,7 @@ jmeter_api_tool.sh - REST API の JMeter テスト（JMX）生成・実行ツー
 例:
   ./jmeter_api_tool.sh init
   ./jmeter_api_tool.sh generate -i input/api_definition.xlsx
+  ./jmeter_api_tool.sh generate -i openapi.json --seed 12345
   ./jmeter_api_tool.sh run -t output/api_test.jmx --threads 10 --loops 100
 EOF
 }
@@ -144,6 +151,7 @@ run_core() {
 #  jmeter_api_tool.sh に埋め込まれ、python3 で実行されます。
 #  ※ 処理内容は jmeter_api_tool.ps1（Windows 版）と同一です。
 # =============================================================================
+import base64
 import datetime
 import io
 import json
@@ -153,6 +161,8 @@ import sys
 import unicodedata
 import zipfile
 import xml.etree.ElementTree as ET
+from collections import OrderedDict
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 
 SPEC = json.loads(r'''{
  "tool": {
@@ -2969,6 +2979,1677 @@ def build_manual(out_dir):
     return [base + '.xlsx', base + '.md']
 
 
+# ----------------------------------------------------------------------------- OpenAPI loading
+# =============================================================================
+#  OpenAPI 3.0.x 定義（JSON）の読み込み
+#  JMeter_Tools の linux/openapi2jmx.sh（Python 本体）から、定義の読み込み・テストデータ生成の
+#  処理をそのまま移植したものです（JMX 出力の部分は除く）。移植時の変更点は次のとおりです。
+#    - GenError を ToolError の派生クラスにした（[ERROR] として表示するため）
+#    - pct_encode を oa_pct_encode に改名した（このツールの pct_encode と名前が重なるため）
+#    - build_operation の「6. 組み立て」を、API一覧（Excel / CSV）の 1 行と同じ項目を返すように変更した
+#    - ヘッダ X-API-KEY の警告文（このツールには共通の X-API-KEY が無いため）
+#  末尾の oa_row_pairs / oa_server_url / load_openapi がこのツール用に追加した処理です。
+#  Windows 版 jmeter_api_tool.ps1 の同じ処理と同一の乱数列・同一の結果になります。
+# =============================================================================
+class GenError(ToolError):
+    """利用者に伝えるべき入力エラー"""
+
+
+# ----------------------------------------------------------------- 乱数（両実装共通）
+MOD31 = 2147483647
+
+
+class Rng(object):
+    """Park-Miller 最小標準乱数（乗数 48271）。PowerShell 版と完全に同じ数列を返す。"""
+
+    def __init__(self, seed):
+        self.state = (seed % (MOD31 - 1)) + 1
+
+    def next31(self):
+        self.state = (self.state * 48271) % MOD31
+        return self.state
+
+    def between(self, lo, hi):
+        if hi <= lo:
+            return lo
+        span = hi - lo + 1
+        if span <= MOD31 - 1:
+            return lo + (self.next31() - 1) % span
+        r = (self.next31() - 1) * (MOD31 - 1) + (self.next31() - 1)
+        return lo + r % span
+
+
+# ----------------------------------------------------------------- 値の表現
+class JNum(object):
+    """JSON に数値として書き出す値（表記を文字列で厳密に保持する）"""
+    __slots__ = ('text',)
+
+    def __init__(self, text):
+        self.text = text
+
+
+SKIP = object()          # 生成しない（循環参照・深さ超過など）
+UNITS_LIMIT = 10 ** 18   # 数値の生成範囲の上限（最小単位に換算した整数で。64bit 整数に収めるため）
+MAX_DECIMALS = 12        # 数値の小数桁の上限
+MAX_DEPTH = 12           # スキーマの入れ子の上限
+
+ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+LOWER_ALNUM = 'abcdefghijklmnopqrstuvwxyz0123456789'
+HEXD = '0123456789abcdef'
+EPOCH_START = 1735689600     # 2025-01-01T00:00:00Z
+EPOCH_END = 1798761599       # 2026-12-31T23:59:59Z
+
+
+def is_obj(x):
+    return isinstance(x, dict)
+
+
+def is_arr(x):
+    return isinstance(x, list)
+
+
+def is_str(x):
+    return isinstance(x, str)
+
+
+def is_bool(x):
+    return isinstance(x, bool)
+
+
+def is_int(x):
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+def is_dec(x):
+    return isinstance(x, Decimal)
+
+
+def is_num(x):
+    return is_int(x) or is_dec(x)
+
+
+def get(o, k):
+    return o.get(k) if isinstance(o, dict) else None
+
+
+def has(o, k):
+    return isinstance(o, dict) and k in o
+
+
+def to_dec(x):
+    if is_int(x):
+        return Decimal(x)
+    if is_dec(x):
+        return x
+    return None
+
+
+def dec_plain(d):
+    return format(d, 'f')
+
+
+def clamp_to(d, lim):
+    if d > lim:
+        return lim
+    if d < -lim:
+        return -lim
+    return d
+
+
+def int_or_none(x):
+    if is_int(x):
+        return x if x >= 0 else None
+    if is_dec(x) and x == x.to_integral_value() and x >= 0:
+        return int(x)
+    return None
+
+
+def dceil(d):
+    return int(d.to_integral_value(rounding=ROUND_CEILING))
+
+
+def dfloor(d):
+    return int(d.to_integral_value(rounding=ROUND_FLOOR))
+
+
+def to_gen(x):
+    """OpenAPI 定義上の値（example/enum など）を生成値の表現へ変換する"""
+    if x is None or is_bool(x):
+        return x
+    if is_int(x):
+        return JNum(str(x))
+    if is_dec(x):
+        return JNum(dec_plain(x))
+    if is_str(x):
+        return x
+    if is_arr(x):
+        return [to_gen(i) for i in x]
+    if is_obj(x):
+        o = OrderedDict()
+        for k, v in x.items():
+            o[k] = to_gen(v)
+        return o
+    return str(x)
+
+
+# ----------------------------------------------------------------- 文字列の整形
+def clean_text(s):
+    """XML 1.0 で使えない文字（制御文字・孤立サロゲート等）を取り除く"""
+    out = []
+    for ch in s:
+        c = ord(ch)
+        if c == 9 or c == 10 or c == 13 or 0x20 <= c <= 0xD7FF or 0xE000 <= c <= 0xFFFD or c >= 0x10000:
+            out.append(ch)
+    return ''.join(out)
+
+
+def json_str(s):
+    s = clean_text(s)
+    out = ['"']
+    for ch in s:
+        if ch == '"':
+            out.append('\\"')
+        elif ch == '\\':
+            out.append('\\\\')
+        elif ch == '\n':
+            out.append('\\n')
+        elif ch == '\r':
+            out.append('\\r')
+        elif ch == '\t':
+            out.append('\\t')
+        else:
+            out.append(ch)
+    out.append('"')
+    return ''.join(out)
+
+
+def to_json(v, indent, pretty):
+    if v is None:
+        return 'null'
+    if v is True:
+        return 'true'
+    if v is False:
+        return 'false'
+    if isinstance(v, JNum):
+        return v.text
+    if is_str(v):
+        return json_str(v)
+    if is_obj(v):
+        if len(v) == 0:
+            return '{}'
+        if not pretty:
+            return '{' + ','.join(json_str(k) + ':' + to_json(x, 0, False) for k, x in v.items()) + '}'
+        pad = '  ' * (indent + 1)
+        items = [pad + json_str(k) + ': ' + to_json(x, indent + 1, True) for k, x in v.items()]
+        return '{\n' + ',\n'.join(items) + '\n' + '  ' * indent + '}'
+    if is_arr(v):
+        if len(v) == 0:
+            return '[]'
+        if not pretty:
+            return '[' + ','.join(to_json(x, 0, False) for x in v) + ']'
+        pad = '  ' * (indent + 1)
+        items = [pad + to_json(x, indent + 1, True) for x in v]
+        return '[\n' + ',\n'.join(items) + '\n' + '  ' * indent + ']'
+    return json_str(str(v))
+
+
+def scalar_str(v):
+    if v is None:
+        return ''
+    if v is True:
+        return 'true'
+    if v is False:
+        return 'false'
+    if isinstance(v, JNum):
+        return v.text
+    if is_str(v):
+        return v
+    return to_json(v, 0, False)
+
+
+UNRESERVED = set(b'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~')
+
+
+def oa_pct_encode(s, keep_slash):
+    out = []
+    for b in clean_text(s).encode('utf-8'):
+        if b in UNRESERVED or (keep_slash and b == 0x2F):
+            out.append(chr(b))
+        else:
+            out.append('%%%02X' % b)
+    return ''.join(out)
+
+
+def header_safe(s):
+    return clean_text(s).replace('\r', ' ').replace('\n', ' ').replace('\t', ' ')
+
+
+def safe_name(s):
+    s = re.sub(r'[^A-Za-z0-9._-]+', '_', s)
+    s = re.sub(r'_+', '_', s).strip('_.')
+    return s if s else 'openapi'
+
+
+def cp_len(s):
+    return len(s)
+
+
+# ----------------------------------------------------------------- 生成コンテキスト
+class Ctx(object):
+    def __init__(self, doc, seed, opts):
+        self.doc = doc
+        self.seed = seed
+        self.rng = Rng(seed)
+        self.required_only = opts['required_only']
+        self.use_examples = opts['use_examples']
+        self.any_method = opts['any_method']
+        self.warnings = []
+
+    def warn(self, msg):
+        if msg not in self.warnings:
+            self.warnings.append(msg)
+
+
+def unescape_token(tok):
+    if '%' in tok:
+        try:
+            from urllib.parse import unquote
+            tok = unquote(tok, encoding='utf-8', errors='strict')
+        except Exception:
+            pass
+    return tok.replace('~1', '/').replace('~0', '~')
+
+
+def resolve_ref(ctx, ref):
+    if not is_str(ref) or not ref.startswith('#'):
+        return None
+    if ref == '#' or ref == '#/':
+        return ctx.doc
+    if not ref.startswith('#/'):
+        return None
+    cur = ctx.doc
+    for tok in ref[2:].split('/'):
+        key = unescape_token(tok)
+        if is_obj(cur) and key in cur:
+            cur = cur[key]
+        elif is_arr(cur) and re.match(r'^(0|[1-9][0-9]*)$', key) and int(key) < len(cur):
+            cur = cur[int(key)]
+        else:
+            return None
+    return cur
+
+
+def ref_text(ref):
+    return ref if is_str(ref) else '(不正な $ref)'
+
+
+def deref(ctx, obj, what):
+    """$ref を辿って実体を返す（Parameter / RequestBody / Response / Example / PathItem 用）"""
+    seen = []
+    while is_obj(obj) and '$ref' in obj:
+        rt = ref_text(obj['$ref'])
+        if rt in seen or len(seen) > 32:
+            ctx.warn('%s の $ref が循環しています: %s' % (what, rt))
+            return None
+        seen.append(rt)
+        target = resolve_ref(ctx, obj['$ref'])
+        if target is None:
+            ctx.warn('%s の $ref を解決できません（外部ファイル参照は未対応）: %s' % (what, rt))
+            return None
+        obj = target
+    return obj
+
+
+# ----------------------------------------------------------------- スキーマ → テストデータ
+TYPES = ('object', 'array', 'integer', 'number', 'boolean', 'string', 'null')
+
+
+def schema_type(schema):
+    t = get(schema, 'type')
+    if is_arr(t):
+        names = [x for x in t if is_str(x)]
+        non_null = [x for x in names if x != 'null']
+        if non_null:
+            t = non_null[0]
+        elif names:
+            t = 'null'
+        else:
+            t = None
+    if is_str(t) and t in TYPES:
+        return t
+    if has(schema, 'properties') or has(schema, 'additionalProperties') or has(schema, 'minProperties') \
+            or has(schema, 'maxProperties'):
+        return 'object'
+    if has(schema, 'items') or has(schema, 'minItems') or has(schema, 'maxItems'):
+        return 'array'
+    fmt = get(schema, 'format')
+    if fmt == 'int32' or fmt == 'int64':
+        return 'integer'
+    if fmt == 'float' or fmt == 'double':
+        return 'number'
+    if has(schema, 'minimum') or has(schema, 'maximum') or has(schema, 'multipleOf') \
+            or has(schema, 'exclusiveMinimum') or has(schema, 'exclusiveMaximum'):
+        return 'number'
+    return 'string'
+
+
+def merge_schemas(a, b):
+    r = OrderedDict(a)
+    for k, v in b.items():
+        if k == 'properties' and is_obj(v):
+            props = OrderedDict(r['properties']) if is_obj(get(r, 'properties')) else OrderedDict()
+            for pk, pv in v.items():
+                if pk not in props:
+                    props[pk] = pv
+            r['properties'] = props
+        elif k == 'required' and is_arr(v):
+            req = list(r['required']) if is_arr(get(r, 'required')) else []
+            for x in v:
+                if x not in req:
+                    req.append(x)
+            r['required'] = req
+        elif k not in r:
+            r[k] = v
+    return r
+
+
+def follow_schema_ref(ctx, s, stack):
+    """スキーマの $ref を辿る。戻り値: (実体 or None, 新しいスタック, 状態 'ok'|'cycle'|'unresolved')"""
+    while is_obj(s) and '$ref' in s:
+        rt = ref_text(s['$ref'])
+        if rt in stack:
+            return None, stack, 'cycle'
+        t = resolve_ref(ctx, s['$ref'])
+        if t is None:
+            ctx.warn('スキーマの $ref を解決できません（外部ファイル参照は未対応）: ' + rt)
+            return None, stack, 'unresolved'
+        stack = stack + [rt]
+        s = t
+    return s, stack, 'ok'
+
+
+def merge_all_of(ctx, schema, stack):
+    result = OrderedDict((k, v) for k, v in schema.items() if k != 'allOf')
+    for sub in schema['allOf']:
+        s, s_stack, state = follow_schema_ref(ctx, sub, stack)
+        if state != 'ok' or not is_obj(s):
+            continue
+        if is_arr(get(s, 'allOf')):
+            s = merge_all_of(ctx, s, s_stack)
+        result = merge_schemas(result, s)
+    return result
+
+
+def gen_value(ctx, schema, depth, stack):
+    if schema is None or schema is True:
+        schema = OrderedDict()
+    if schema is False or not is_obj(schema):
+        return SKIP
+    if '$ref' in schema:
+        s, new_stack, state = follow_schema_ref(ctx, schema, stack)
+        if state == 'cycle':
+            return SKIP
+        if state == 'unresolved':
+            return 'UNRESOLVED_REF'
+        return gen_value(ctx, s, depth, new_stack)
+    if depth > MAX_DEPTH:
+        return SKIP
+    if is_arr(get(schema, 'allOf')):
+        schema = merge_all_of(ctx, schema, stack)
+    for key in ('oneOf', 'anyOf'):
+        alts = get(schema, key)
+        if is_arr(alts) and len(alts) > 0:
+            base = OrderedDict((k, v) for k, v in schema.items() if k != 'oneOf' and k != 'anyOf')
+            alt, alt_stack, state = follow_schema_ref(ctx, alts[0], stack)
+            if state == 'cycle':
+                return SKIP
+            if state == 'unresolved':
+                return 'UNRESOLVED_REF'
+            if not is_obj(alt):
+                alt = OrderedDict()
+            return gen_value(ctx, merge_schemas(base, alt), depth, alt_stack)
+    if ctx.use_examples:
+        if 'example' in schema:
+            return to_gen(schema['example'])
+        exs = get(schema, 'examples')
+        if is_arr(exs) and len(exs) > 0:
+            return to_gen(exs[0])
+        if 'default' in schema:
+            return to_gen(schema['default'])
+    if 'const' in schema:
+        return to_gen(schema['const'])
+    enum = get(schema, 'enum')
+    if is_arr(enum) and len(enum) > 0:
+        cands = [e for e in enum if e is not None]
+        if not cands:
+            return None
+        return to_gen(cands[ctx.rng.between(0, len(cands) - 1)])
+    t = schema_type(schema)
+    if t == 'object':
+        return gen_object(ctx, schema, depth, stack)
+    if t == 'array':
+        return gen_array(ctx, schema, depth, stack)
+    if t == 'integer':
+        return gen_integer(ctx, schema)
+    if t == 'number':
+        return gen_number(ctx, schema)
+    if t == 'boolean':
+        return ctx.rng.between(0, 1) == 1
+    if t == 'null':
+        return None
+    return gen_string(ctx, schema)
+
+
+def is_read_only(ctx, pschema):
+    s = pschema
+    guard = 0
+    while is_obj(s) and '$ref' in s and guard < 32:
+        s = resolve_ref(ctx, s['$ref'])
+        guard += 1
+    return is_obj(s) and get(s, 'readOnly') is True
+
+
+def gen_object(ctx, schema, depth, stack):
+    result = OrderedDict()
+    props = get(schema, 'properties')
+    req = get(schema, 'required')
+    required = [x for x in req if is_str(x)] if is_arr(req) else []
+    if is_obj(props):
+        for name, pschema in props.items():
+            if ctx.required_only and name not in required:
+                continue
+            if is_read_only(ctx, pschema):
+                continue
+            v = gen_value(ctx, pschema, depth + 1, stack)
+            if v is SKIP:
+                continue
+            result[name] = v
+    addl = get(schema, 'additionalProperties')
+    if len(result) == 0 and not (is_obj(props) and len(props) > 0) and is_obj(addl) and len(addl) > 0 \
+            and not ctx.required_only:
+        v = gen_value(ctx, addl, depth + 1, stack)
+        if v is not SKIP:
+            result['key1'] = v
+    return result
+
+
+def gen_array(ctx, schema, depth, stack):
+    items = get(schema, 'items')
+    if not is_obj(items):
+        items = OrderedDict()
+    mn = int_or_none(get(schema, 'minItems'))
+    mx = int_or_none(get(schema, 'maxItems'))
+    n = max(mn if mn is not None else 0, 1)
+    if mx is not None and n > mx:
+        n = mx
+    if n > 50:
+        n = 50
+    unique = get(schema, 'uniqueItems') is True
+    result = []
+    seen = []
+    for _ in range(n):
+        v = gen_value(ctx, items, depth + 1, stack)
+        if v is SKIP:
+            break
+        if unique:
+            key = to_json(v, 0, False)
+            tries = 0
+            while key in seen and tries < 10:
+                v = gen_value(ctx, items, depth + 1, stack)
+                if v is SKIP:
+                    break
+                key = to_json(v, 0, False)
+                tries += 1
+            if v is SKIP:
+                break
+            seen.append(key)
+        result.append(v)
+    return result
+
+
+def num_bounds(schema, scale):
+    """minimum/maximum 等を scale（10 の d 乗）単位の整数範囲に変換する"""
+    mn = to_dec(get(schema, 'minimum'))
+    mx = to_dec(get(schema, 'maximum'))
+    exmin = get(schema, 'exclusiveMinimum')
+    exmax = get(schema, 'exclusiveMaximum')
+    ex_lo = exmin is True
+    ex_hi = exmax is True
+    if is_num(exmin):
+        e = to_dec(exmin)
+        if mn is None or e >= mn:
+            mn = e
+            ex_lo = True
+    if is_num(exmax):
+        e = to_dec(exmax)
+        if mx is None or e <= mx:
+            mx = e
+            ex_hi = True
+    vlim = Decimal(UNITS_LIMIT // scale)
+    lo = None
+    hi = None
+    if mn is not None:
+        v = clamp_to(mn, vlim) * scale
+        lo = dceil(v)
+        if ex_lo and Decimal(lo) == v:
+            lo += 1
+    if mx is not None:
+        v = clamp_to(mx, vlim) * scale
+        hi = dfloor(v)
+        if ex_hi and Decimal(hi) == v:
+            hi -= 1
+    one = scale
+    if lo is None and hi is None:
+        lo = one
+        hi = 100 * one
+    elif hi is None:
+        hi = lo + 99 * one
+    elif lo is None:
+        lo = one if hi >= one else hi - 99 * one
+    if lo > hi:
+        hi = lo
+    return lo, hi
+
+
+def ceil_div(a, b):
+    return -((-a) // b)
+
+
+def gen_integer(ctx, schema):
+    lo, hi = num_bounds(schema, 1)
+    if get(schema, 'format') == 'int32':
+        lo = max(lo, -2147483648)
+        hi = min(hi, 2147483647)
+        if lo > hi:
+            hi = lo
+    m = to_dec(get(schema, 'multipleOf'))
+    if m is not None and m > 0 and m == m.to_integral_value():
+        mi = int(m)
+        kmin = ceil_div(lo, mi)
+        kmax = hi // mi
+        if kmin <= kmax:
+            return JNum(str(ctx.rng.between(kmin, kmax) * mi))
+        return JNum(str(lo))
+    return JNum(str(ctx.rng.between(lo, hi)))
+
+
+def decimals_of(d):
+    s = dec_plain(d)
+    if '.' in s:
+        return len(s.split('.', 1)[1].rstrip('0'))
+    return 0
+
+
+def fmt_units(units, d):
+    neg = units < 0
+    a = -units if neg else units
+    if d == 0:
+        s = str(a)
+    else:
+        p = 10 ** d
+        s = str(a // p) + '.' + str(a % p).rjust(d, '0')
+    return '-' + s if neg else s
+
+
+def gen_number(ctx, schema):
+    m = to_dec(get(schema, 'multipleOf'))
+    if m is not None and m <= 0:
+        m = None
+    d = decimals_of(m) if m is not None else 2
+    if d > MAX_DECIMALS:
+        d = MAX_DECIMALS
+    scale = 10 ** d
+    lo, hi = num_bounds(schema, scale)
+    units = None
+    if m is not None:
+        mu = m * scale
+        if mu > 0 and mu == mu.to_integral_value():
+            mi = int(mu)
+            kmin = ceil_div(lo, mi)
+            kmax = hi // mi
+            units = ctx.rng.between(kmin, kmax) * mi if kmin <= kmax else lo
+    if units is None:
+        units = ctx.rng.between(lo, hi)
+    return JNum(fmt_units(units, d))
+
+
+def rand_str(ctx, pool, n):
+    out = []
+    for _ in range(n):
+        out.append(pool[ctx.rng.between(0, len(pool) - 1)])
+    return ''.join(out)
+
+
+def choose_len(ctx, min_l, max_l):
+    lo = max(min_l if min_l is not None else 0, 8)
+    if max_l is not None and lo > max_l:
+        lo = max_l
+    if max_l is None:
+        hi = max(lo, 16)
+    else:
+        hi = min(max_l, max(lo, 16))
+    if hi < lo:
+        hi = lo
+    return ctx.rng.between(lo, hi)
+
+
+def epoch_to_utc(secs):
+    return datetime.datetime(1970, 1, 1) + datetime.timedelta(seconds=secs)
+
+
+def gen_string(ctx, schema):
+    fmt = get(schema, 'format')
+    fmt = fmt if is_str(fmt) else ''
+    min_l = int_or_none(get(schema, 'minLength'))
+    max_l = int_or_none(get(schema, 'maxLength'))
+    pattern = get(schema, 'pattern')
+    if is_str(pattern) and pattern != '':
+        s = gen_from_pattern(ctx, pattern, min_l, max_l)
+        if s is not None:
+            return s
+    if fmt == 'date-time':
+        return epoch_to_utc(ctx.rng.between(EPOCH_START, EPOCH_END)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    if fmt == 'date':
+        days = ctx.rng.between(EPOCH_START // 86400, EPOCH_END // 86400)
+        return epoch_to_utc(days * 86400).strftime('%Y-%m-%d')
+    if fmt == 'time':
+        secs = ctx.rng.between(0, 86399)
+        return '%02d:%02d:%02d' % (secs // 3600, (secs % 3600) // 60, secs % 60)
+    if fmt == 'email':
+        return rand_str(ctx, LOWER_ALNUM, 8) + '@example.com'
+    if fmt == 'uuid':
+        chars = []
+        for i in range(32):
+            if i == 12:
+                chars.append('4')
+            elif i == 16:
+                chars.append(HEXD[8 + ctx.rng.between(0, 3)])
+            else:
+                chars.append(HEXD[ctx.rng.between(0, 15)])
+        u = ''.join(chars)
+        return u[0:8] + '-' + u[8:12] + '-' + u[12:16] + '-' + u[16:20] + '-' + u[20:32]
+    if fmt in ('uri', 'url', 'uri-reference', 'iri', 'iri-reference'):
+        return 'https://example.com/' + rand_str(ctx, LOWER_ALNUM, 8)
+    if fmt in ('hostname', 'idn-hostname'):
+        return rand_str(ctx, LOWER_ALNUM, 8) + '.example.com'
+    if fmt == 'ipv4':
+        return '192.0.2.' + str(ctx.rng.between(1, 254))
+    if fmt == 'ipv6':
+        return '2001:db8::' + ('%x' % ctx.rng.between(1, 65535))
+    if fmt == 'byte':
+        raw = bytearray()
+        for _ in range(12):
+            raw.append(ctx.rng.between(0, 255))
+        return base64.b64encode(bytes(raw)).decode('ascii')
+    if fmt == 'password':
+        return rand_str(ctx, ALNUM, 12)
+    if fmt == 'binary':
+        return rand_str(ctx, ALNUM, 16)
+    return rand_str(ctx, ALNUM, choose_len(ctx, min_l, max_l))
+
+
+# ----------------------------------------------------------------- pattern（正規表現）から文字列を生成
+class PatternError(Exception):
+    pass
+
+
+def _codes(a, b):
+    return list(range(a, b + 1))
+
+
+DIGIT_SET = _codes(0x30, 0x39)
+UPPER_SET = _codes(0x41, 0x5A)
+LOWER_SET = _codes(0x61, 0x7A)
+ALNUM_SET = DIGIT_SET + UPPER_SET + LOWER_SET
+WORD_SET = sorted(ALNUM_SET + [0x5F])
+NONDIGIT_SET = UPPER_SET + LOWER_SET
+NONWORD_SET = [0x2D, 0x2E]
+SPACE_SET = [0x20]
+NEG_BASE = sorted(ALNUM_SET + [0x2D, 0x2E, 0x5F])
+PRINTABLE_SET = _codes(0x21, 0x7E)
+
+
+def valid_code(c):
+    return c == 9 or c == 10 or c == 13 or 0x20 <= c <= 0xD7FF or 0xE000 <= c <= 0xFFFD or 0x10000 <= c <= 0x10FFFF
+
+
+class PatternParser(object):
+    def __init__(self, pattern):
+        self.p = pattern
+        self.i = 0
+        self.n = len(pattern)
+
+    def peek(self, k=0):
+        j = self.i + k
+        return self.p[j] if j < self.n else None
+
+    def take(self):
+        ch = self.p[self.i]
+        self.i += 1
+        return ch
+
+    def parse(self):
+        node = self.alt()
+        if self.i != self.n:
+            raise PatternError('unexpected')
+        return node
+
+    def alt(self):
+        options = [self.seq()]
+        while self.peek() == '|':
+            self.take()
+            options.append(self.seq())
+        if len(options) == 1:
+            return options[0]
+        return ('alt', options)
+
+    def seq(self):
+        items = []
+        while True:
+            ch = self.peek()
+            if ch is None or ch == '|' or ch == ')':
+                break
+            items.append(self.quant(self.atom()))
+        return ('seq', items)
+
+    def atom(self):
+        ch = self.take()
+        if ch == '(':
+            if self.peek() == '?':
+                self.take()
+                c2 = self.peek()
+                if c2 == ':':
+                    self.take()
+                elif c2 == 'P' and self.peek(1) == '<':
+                    self.skip_group_name(2)
+                elif c2 == '<' and self.peek(1) is not None and self.peek(1) not in ('=', '!'):
+                    self.skip_group_name(1)
+                else:
+                    raise PatternError('unsupported group')
+            node = self.alt()
+            if self.peek() != ')':
+                raise PatternError('unbalanced')
+            self.take()
+            return node
+        if ch == '[':
+            return self.char_class()
+        if ch == '.':
+            return ('set', ALNUM_SET)
+        if ch == '^' or ch == '$':
+            return ('seq', [])
+        if ch == '\\':
+            return self.escape(False)
+        if ch in ('*', '+', '?', ')'):
+            raise PatternError('quantifier without target')
+        return ('lit', ord(ch))
+
+    def skip_group_name(self, k):
+        for _ in range(k):
+            self.take()
+        while True:
+            c = self.peek()
+            if c is None:
+                raise PatternError('bad group name')
+            self.take()
+            if c == '>':
+                return
+
+    def hex_digits(self, count):
+        s = self.p[self.i:self.i + count]
+        if len(s) != count or not re.match(r'^[0-9A-Fa-f]+$', s):
+            raise PatternError('bad hex escape')
+        self.i += count
+        return int(s, 16)
+
+    def escape(self, in_class):
+        if self.i >= self.n:
+            raise PatternError('trailing backslash')
+        ch = self.take()
+        if ch == 'd':
+            return ('set', DIGIT_SET)
+        if ch == 'D':
+            return ('set', NONDIGIT_SET)
+        if ch == 'w':
+            return ('set', WORD_SET)
+        if ch == 'W':
+            return ('set', NONWORD_SET)
+        if ch == 's':
+            return ('set', SPACE_SET)
+        if ch == 'S':
+            return ('set', ALNUM_SET)
+        if ch == 't':
+            return ('lit', 9)
+        if ch == 'n':
+            return ('lit', 10)
+        if ch == 'r':
+            return ('lit', 13)
+        if ch == 'u':
+            c = self.hex_digits(4)
+            if not valid_code(c):
+                raise PatternError('bad code point')
+            return ('lit', c)
+        if ch == 'x':
+            c = self.hex_digits(2)
+            if not valid_code(c):
+                raise PatternError('bad code point')
+            return ('lit', c)
+        if ch in ('b', 'B', 'A', 'z', 'Z', 'G'):
+            if in_class:
+                raise PatternError('unsupported escape in class')
+            return ('seq', [])
+        if ch in '0123456789' or ch in ('p', 'P', 'k', 'c', 'f', 'v', 'e', 'a', 'Q', 'E'):
+            raise PatternError('unsupported escape')
+        return ('lit', ord(ch))
+
+    def class_item(self):
+        ch = self.take()
+        if ch == '\\':
+            return self.escape(True)
+        if ch == '[' and self.peek() == ':':
+            raise PatternError('posix class')
+        return ('lit', ord(ch))
+
+    def char_class(self):
+        negate = False
+        if self.peek() == '^':
+            self.take()
+            negate = True
+        codes = set()
+        first = True
+        while True:
+            if self.i >= self.n:
+                raise PatternError('unterminated class')
+            if self.peek() == ']' and not first:
+                self.take()
+                break
+            first = False
+            item = self.class_item()
+            if item[0] == 'lit' and self.peek() == '-' and self.peek(1) is not None and self.peek(1) != ']':
+                self.take()
+                item2 = self.class_item()
+                if item2[0] != 'lit':
+                    raise PatternError('bad range')
+                a = item[1]
+                b = item2[1]
+                if a > b or b - a > 70000:
+                    raise PatternError('bad range')
+                for c in range(a, b + 1):
+                    codes.add(c)
+            elif item[0] == 'lit':
+                codes.add(item[1])
+            elif item[0] == 'set':
+                for c in item[1]:
+                    codes.add(c)
+            else:
+                raise PatternError('bad class item')
+        if negate:
+            pool = [c for c in NEG_BASE if c not in codes]
+            if not pool:
+                pool = [c for c in PRINTABLE_SET if c not in codes]
+        else:
+            pool = sorted(codes)
+        pool = [c for c in pool if valid_code(c)]
+        if not pool:
+            raise PatternError('empty class')
+        return ('set', pool)
+
+    def quant(self, node):
+        while True:
+            ch = self.peek()
+            if ch == '*':
+                self.take()
+                mn, mx = 0, None
+            elif ch == '+':
+                self.take()
+                mn, mx = 1, None
+            elif ch == '?':
+                self.take()
+                mn, mx = 0, 1
+            elif ch == '{':
+                m = re.match(r'\{([0-9]+)(,([0-9]*))?\}', self.p[self.i:])
+                if m is None:
+                    return node
+                self.i += len(m.group(0))
+                mn = int(m.group(1))
+                if m.group(2) is None:
+                    mx = mn
+                elif m.group(3) == '':
+                    mx = None
+                else:
+                    mx = int(m.group(3))
+                if (mx is not None and mx < mn) or mn > 1000:
+                    raise PatternError('bad quantifier')
+            else:
+                return node
+            if self.peek() == '?' or self.peek() == '+':
+                self.take()
+            node = ('rep', node, mn, mx)
+
+
+def gen_node(ctx, node, out):
+    t = node[0]
+    if t == 'lit':
+        out.append(chr(node[1]))
+    elif t == 'set':
+        pool = node[1]
+        out.append(chr(pool[ctx.rng.between(0, len(pool) - 1)]))
+    elif t == 'seq':
+        for x in node[1]:
+            gen_node(ctx, x, out)
+    elif t == 'alt':
+        opts = node[1]
+        gen_node(ctx, opts[ctx.rng.between(0, len(opts) - 1)], out)
+    elif t == 'rep':
+        mn = node[2]
+        mx = node[3]
+        if mx is None:
+            mx = mn + 5
+        cap = max(mn, 16)
+        if mx > cap:
+            mx = cap
+        for _ in range(ctx.rng.between(mn, mx)):
+            gen_node(ctx, node[1], out)
+
+
+def gen_from_pattern(ctx, pattern, min_l, max_l):
+    try:
+        ast = PatternParser(pattern).parse()
+    except PatternError:
+        ctx.warn('pattern を解釈できないためランダム英数字で代用しました: ' + pattern)
+        return None
+    try:
+        rx = re.compile(pattern)
+    except Exception:
+        rx = None
+    last = None
+    for _ in range(10):
+        out = []
+        gen_node(ctx, ast, out)
+        s = ''.join(out)
+        last = s
+        if rx is not None and rx.search(s) is None:
+            continue
+        if min_l is not None and cp_len(s) < min_l:
+            continue
+        if max_l is not None and cp_len(s) > max_l:
+            continue
+        return s
+    if last is not None and (rx is None or rx.search(last) is not None):
+        return last
+    ctx.warn('pattern に一致する値を生成できないためランダム英数字で代用しました: ' + pattern)
+    return None
+
+
+# ----------------------------------------------------------------- パラメータ
+METHOD_KEYS = ('get', 'put', 'post', 'delete', 'options', 'head', 'patch', 'trace')
+ANY_KEY = 'x-amazon-apigateway-any-method'
+SKIP_HEADERS = ('accept', 'content-type', 'authorization')
+MANAGED_HEADERS = ('content-length', 'host', 'transfer-encoding', 'connection')
+
+
+def collect_params(ctx, item, op):
+    table = OrderedDict()
+    for src in (get(item, 'parameters'), get(op, 'parameters')):
+        if not is_arr(src):
+            continue
+        for p in src:
+            rp = deref(ctx, p, 'parameter')
+            if not is_obj(rp):
+                continue
+            name = get(rp, 'name')
+            loc = get(rp, 'in')
+            if not is_str(name) or not is_str(loc) or name == '':
+                continue
+            table[loc + '\n' + name] = rp
+    return list(table.values())
+
+
+def first_value(d):
+    for k in d:
+        return d[k]
+    return None
+
+
+def param_value(ctx, p):
+    if ctx.use_examples:
+        if 'example' in p:
+            return to_gen(p['example'])
+        exs = get(p, 'examples')
+        if is_obj(exs) and len(exs) > 0:
+            first = deref(ctx, first_value(exs), 'example')
+            if is_obj(first) and 'value' in first:
+                return to_gen(first['value'])
+    schema = get(p, 'schema')
+    if schema is None:
+        content = get(p, 'content')
+        if is_obj(content) and len(content) > 0:
+            schema = get(first_value(content), 'schema')
+    if schema is None:
+        schema = OrderedDict([('type', 'string')])
+    v = gen_value(ctx, schema, 0, [])
+    if v is SKIP:
+        v = ''
+    return v
+
+
+def simple_style(v, explode):
+    if is_arr(v):
+        return ','.join(scalar_str(x) for x in v)
+    if is_obj(v):
+        if explode:
+            return ','.join(k + '=' + scalar_str(x) for k, x in v.items())
+        return ','.join(k + ',' + scalar_str(x) for k, x in v.items())
+    return scalar_str(v)
+
+
+def query_pairs(name, v, style, explode):
+    if is_arr(v):
+        if style == 'form' and explode:
+            return [(name, scalar_str(x)) for x in v]
+        if style == 'spaceDelimited':
+            sep = ' '
+        elif style == 'pipeDelimited':
+            sep = '|'
+        else:
+            sep = ','
+        return [(name, sep.join(scalar_str(x) for x in v))]
+    if is_obj(v):
+        if style == 'deepObject':
+            return [(name + '[' + k + ']', scalar_str(x)) for k, x in v.items()]
+        if explode:
+            return [(k, scalar_str(x)) for k, x in v.items()]
+        return [(name, ','.join(k + ',' + scalar_str(x) for k, x in v.items()))]
+    return [(name, scalar_str(v))]
+
+
+# ----------------------------------------------------------------- リクエストボディ
+def media_base(mt):
+    return mt.split(';', 1)[0].strip().lower()
+
+
+def choose_media(keys):
+    # JSON 系 → フォーム → マルチパート の順に優先し、どれも無ければ定義の先頭のメディアタイプを使う
+    preds = (
+        lambda b: b == 'application/json',
+        lambda b: b.endswith('+json'),
+        lambda b: 'json' in b,
+        lambda b: b == 'application/x-www-form-urlencoded',
+        lambda b: b == 'multipart/form-data',
+    )
+    for pred in preds:
+        for k in keys:
+            if pred(media_base(k)):
+                return k
+    return keys[0]
+
+
+def media_kind(mt):
+    b = media_base(mt)
+    if b == 'application/json' or b.endswith('+json') or 'json' in b or b == '*/*' or b == 'application/*':
+        return 'json'
+    if b == 'application/x-www-form-urlencoded':
+        return 'form'
+    if b.startswith('multipart/'):
+        return 'multipart'
+    if b.endswith('/xml') or b.endswith('+xml'):
+        return 'xml'
+    if b.startswith('text/'):
+        return 'text'
+    return 'binary'
+
+
+def content_type_for(mt, kind):
+    if '*' in media_base(mt):
+        if kind == 'json':
+            return 'application/json'
+        if kind == 'xml':
+            return 'application/xml'
+        if kind == 'text':
+            return 'text/plain'
+        return 'application/octet-stream'
+    return mt.strip()
+
+
+def xml_name(n):
+    n = re.sub(r'[^A-Za-z0-9_.-]', '_', n)
+    if n == '' or not re.match(r'^[A-Za-z_]', n):
+        n = '_' + n
+    return n
+
+
+def xml_text(s):
+    return clean_text(s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+
+def to_xml(v, name, indent):
+    pad = '  ' * indent
+    if is_obj(v):
+        if len(v) == 0:
+            return pad + '<' + name + '/>'
+        lines = [pad + '<' + name + '>']
+        for k, x in v.items():
+            kn = xml_name(k)
+            if is_arr(x):
+                for it in x:
+                    lines.append(to_xml(it, kn, indent + 1))
+            else:
+                lines.append(to_xml(x, kn, indent + 1))
+        lines.append(pad + '</' + name + '>')
+        return '\n'.join(lines)
+    if is_arr(v):
+        if len(v) == 0:
+            return pad + '<' + name + '/>'
+        return '\n'.join(to_xml(it, name, indent) for it in v)
+    return pad + '<' + name + '>' + xml_text(scalar_str(v)) + '</' + name + '>'
+
+
+def xml_root_name(ctx, schema):
+    s = schema
+    name = None
+    guard = 0
+    while is_obj(s) and '$ref' in s and guard < 32:
+        ref = s['$ref']
+        if is_str(ref):
+            name = ref.split('/')[-1]
+        s = resolve_ref(ctx, ref)
+        guard += 1
+    x = get(s, 'xml')
+    if is_obj(x) and is_str(get(x, 'name')) and x['name'] != '':
+        name = x['name']
+    if not name:
+        name = 'root'
+    return xml_name(name)
+
+
+def build_body(ctx, op):
+    if not has(op, 'requestBody'):
+        return None
+    rb = deref(ctx, op['requestBody'], 'requestBody')
+    content = get(rb, 'content')
+    if not is_obj(content) or len(content) == 0:
+        return None
+    mt = choose_media(list(content.keys()))
+    media = content[mt]
+    schema = get(media, 'schema')
+    kind = media_kind(mt)
+    have = False
+    value = None
+    if ctx.use_examples and is_obj(media):
+        if 'example' in media:
+            value = to_gen(media['example'])
+            have = True
+        else:
+            exs = get(media, 'examples')
+            if is_obj(exs) and len(exs) > 0:
+                first = deref(ctx, first_value(exs), 'example')
+                if is_obj(first) and 'value' in first:
+                    value = to_gen(first['value'])
+                    have = True
+    if not have:
+        if schema is None:
+            value = OrderedDict() if kind in ('json', 'form', 'multipart', 'xml') else rand_str(ctx, ALNUM, 16)
+        else:
+            value = gen_value(ctx, schema, 0, [])
+            if value is SKIP:
+                value = OrderedDict()
+    ctype = content_type_for(mt, kind)
+    if kind == 'json':
+        return {'kind': kind, 'ctype': ctype, 'text': to_json(value, 0, True), 'pairs': []}
+    if kind == 'form' or kind == 'multipart':
+        pairs = []
+        if is_obj(value):
+            for k, x in value.items():
+                if is_arr(x):
+                    for it in x:
+                        pairs.append((k, scalar_str(it)))
+                else:
+                    pairs.append((k, scalar_str(x)))
+        else:
+            pairs.append(('value', scalar_str(value)))
+        return {'kind': kind, 'ctype': ctype, 'text': '', 'pairs': pairs}
+    if kind == 'xml':
+        text = '<?xml version="1.0" encoding="UTF-8"?>\n' + to_xml(value, xml_root_name(ctx, schema), 0)
+        return {'kind': kind, 'ctype': ctype, 'text': text, 'pairs': []}
+    text = value if is_str(value) else to_json(value, 0, True)
+    return {'kind': kind, 'ctype': ctype, 'text': text, 'pairs': []}
+
+
+# ----------------------------------------------------------------- レスポンス（Accept・期待ステータス）
+def is_2xx(k):
+    return re.match(r'^2[0-9][0-9]$', k) is not None or k == '2XX'
+
+
+def pick_accept(ctx, op):
+    responses = get(op, 'responses')
+    if not is_obj(responses):
+        return None
+    for k, resp in responses.items():
+        if not is_2xx(str(k).strip().upper()):
+            continue
+        r = deref(ctx, resp, 'response')
+        content = get(r, 'content')
+        if is_obj(content) and len(content) > 0:
+            mt = list(content.keys())[0]
+            if '*' in mt:
+                return None
+            return mt.strip()
+    return None
+
+
+def success_codes(op):
+    responses = get(op, 'responses')
+    codes = []
+    has_range = False
+    if is_obj(responses):
+        for k in responses.keys():
+            ks = str(k).strip().upper()
+            if re.match(r'^2[0-9][0-9]$', ks):
+                if ks not in codes:
+                    codes.append(ks)
+            elif ks == '2XX':
+                has_range = True
+    return codes, has_range
+
+
+# ----------------------------------------------------------------- セキュリティ
+def effective_security(ctx, op):
+    if has(op, 'security'):
+        return get(op, 'security')
+    return get(ctx.doc, 'security')
+
+
+def security_text(ctx, op):
+    sec = effective_security(ctx, op)
+    if not is_arr(sec):
+        return None
+    if len(sec) == 0:
+        return 'なし（認証不要）'
+    alts = []
+    for req in sec:
+        if not is_obj(req):
+            continue
+        if len(req) == 0:
+            alts.append('認証なしも可')
+            continue
+        parts = []
+        for name, scopes in req.items():
+            sc = [x for x in scopes if is_str(x)] if is_arr(scopes) else []
+            parts.append(name + ('[' + ', '.join(sc) + ']' if sc else ''))
+        alts.append(' かつ '.join(parts))
+    return ' または '.join(alts) if alts else None
+
+
+def scheme_uses_authorization(scheme):
+    if not is_obj(scheme):
+        return False
+    t = get(scheme, 'type')
+    if t == 'oauth2' or t == 'openIdConnect' or t == 'http':
+        return True
+    if t == 'apiKey':
+        return get(scheme, 'in') == 'header' and is_str(get(scheme, 'name')) \
+            and scheme['name'].lower() == 'authorization'
+    return False
+
+
+def needs_auth_header(ctx, ops):
+    schemes = get(get(ctx.doc, 'components'), 'securitySchemes')
+    for info in ops:
+        sec = effective_security(ctx, info['op'])
+        if not is_arr(sec):
+            continue
+        for req in sec:
+            if not is_obj(req):
+                continue
+            for name in req.keys():
+                sch = deref(ctx, get(schemes, name), 'securityScheme')
+                if scheme_uses_authorization(sch):
+                    return True
+    return False
+
+
+# ----------------------------------------------------------------- オペレーション
+def collect_operations(ctx):
+    ops = []
+    paths = get(ctx.doc, 'paths')
+    for path, item in paths.items():
+        if path.startswith('x-'):
+            continue
+        item = deref(ctx, item, 'pathItem')
+        if not is_obj(item):
+            continue
+        for key, op in item.items():
+            k = key.lower()
+            if k in METHOD_KEYS:
+                method = k.upper()
+                is_any = False
+            elif k == ANY_KEY:
+                method = ctx.any_method
+                is_any = True
+            else:
+                continue
+            if not is_obj(op):
+                continue
+            ops.append({'path': path, 'item': item, 'op': op, 'key': key, 'method': method, 'is_any': is_any})
+    return ops
+
+
+PLACEHOLDER_RE = re.compile(r'\{([^{}]+)\}')
+
+
+def build_operation(ctx, info, label):
+    path = info['path']
+    item = info['item']
+    op = info['op']
+    method = info['method']
+    params = collect_params(ctx, item, op)
+
+    # 1. パスパラメータ
+    path_vals = OrderedDict()
+    for p in params:
+        if get(p, 'in') == 'path':
+            path_vals[p['name']] = (param_value(ctx, p), get(p, 'explode') is True)
+    for m in PLACEHOLDER_RE.finditer(path):
+        ph = m.group(1)
+        base = ph[:-1] if ph.endswith('+') else ph
+        if base not in path_vals:
+            ctx.warn('%s: パス変数 {%s} のパラメータ定義が無いため英数字 8 文字を仮設定しました' % (label, base))
+            path_vals[base] = (rand_str(ctx, ALNUM, 8), False)
+    parts = []
+    pos = 0
+    for m in PLACEHOLDER_RE.finditer(path):
+        parts.append(path[pos:m.start()])
+        ph = m.group(1)
+        greedy = ph.endswith('+')
+        base = ph[:-1] if greedy else ph
+        v, explode = path_vals[base]
+        parts.append(oa_pct_encode(simple_style(v, explode), greedy))
+        pos = m.end()
+    parts.append(path[pos:])
+    real_path = ''.join(parts)
+    if not real_path.startswith('/'):
+        real_path = '/' + real_path
+
+    # 2. クエリパラメータ
+    qpairs = []
+    for p in params:
+        if get(p, 'in') != 'query':
+            continue
+        if ctx.required_only and get(p, 'required') is not True:
+            continue
+        v = param_value(ctx, p)
+        style = get(p, 'style')
+        style = style if is_str(style) else 'form'
+        explode = get(p, 'explode')
+        explode = explode if is_bool(explode) else (style == 'form')
+        qpairs.extend(query_pairs(p['name'], v, style, explode))
+
+    # 3. ヘッダパラメータ
+    hparams = []
+    for p in params:
+        if get(p, 'in') != 'header':
+            continue
+        name = p['name']
+        lname = name.lower()
+        if lname in SKIP_HEADERS:
+            continue
+        if lname == 'x-api-key':
+            ctx.warn('%s: ヘッダ %s は API キーの実値が必要なため生成しません（設定 common_headers に「%s: キーの値」を指定してください）'
+                     % (label, name, name))
+            continue
+        if lname in MANAGED_HEADERS:
+            ctx.warn('%s: ヘッダ %s は HTTP クライアントが自動設定するため生成しません' % (label, name))
+            continue
+        if ctx.required_only and get(p, 'required') is not True:
+            continue
+        v = param_value(ctx, p)
+        hparams.append((name, header_safe(simple_style(v, get(p, 'explode') is True))))
+
+    # 4. クッキーパラメータ
+    cookies = []
+    for p in params:
+        if get(p, 'in') != 'cookie':
+            continue
+        if ctx.required_only and get(p, 'required') is not True:
+            continue
+        v = param_value(ctx, p)
+        cookies.append(p['name'] + '=' + oa_pct_encode(simple_style(v, False), False))
+
+    # 5. リクエストボディ
+    body = build_body(ctx, op)
+
+    # 6. 組み立て（API一覧（Excel / CSV）の 1 行と同じ項目を返す。クエリを Parameters に入れるか URL に
+    #    付けるかは、Excel / CSV の行と同じく normalize_api がメソッドで決める）
+    body_type = ''
+    body_text = ''
+    headers = []
+    if body is not None:
+        if body['kind'] in ('form', 'multipart'):
+            body_type = body['kind']
+            body_text = oa_row_pairs(body['pairs'])
+            if body['kind'] == 'form':
+                headers.append(('Content-Type', body['ctype']))
+        else:
+            body_type = 'json' if body['kind'] == 'json' else 'raw'
+            body_text = body['text']
+            headers.append(('Content-Type', body['ctype']))
+    accept = pick_accept(ctx, op)
+    if accept is not None:
+        headers.append(('Accept', accept))
+    headers.extend(hparams)
+    if cookies:
+        headers.append(('Cookie', '; '.join(cookies)))
+
+    codes, has_range = success_codes(op)
+    has_data = len(path_vals) > 0 or len(qpairs) > 0 or len(hparams) > 0 or len(cookies) > 0 or body is not None
+    comment = operation_comment(ctx, info, body, has_data)
+    if has_range and not codes:
+        comment += '\n※ 成功レスポンスが 2XX（範囲指定）のため期待ステータスは空欄です（JMeter の既定の判定: 2xx / 3xx = 成功）。'
+    return {'method': method, 'url': real_path, 'query': oa_row_pairs(qpairs),
+            'headers': '\n'.join(k + ': ' + v for k, v in headers), 'body_type': body_type, 'body': body_text,
+            'expected_status': ','.join(codes), 'comment': comment}
+
+
+def operation_comment(ctx, info, body, has_data):
+    op = info['op']
+    lines = []
+    summary = get(op, 'summary')
+    if is_str(summary) and summary.strip():
+        lines.append('概要: ' + summary.strip())
+    desc = get(op, 'description')
+    if is_str(desc) and desc.strip():
+        lines.append('説明: ' + desc.strip())
+    lines.append('OpenAPI 定義: ' + info['key'] + ' ' + info['path'])
+    op_id = get(op, 'operationId')
+    if is_str(op_id) and op_id:
+        lines.append('operationId: ' + op_id)
+    if info['is_any']:
+        lines.append('ANY メソッド（x-amazon-apigateway-any-method）のため ' + info['method']
+                     + ' で代表して送信します（生成時の --any-method / -AnyMethod で変更可）。')
+    sec = security_text(ctx, op)
+    if sec is not None:
+        lines.append('認可（security）: ' + sec)
+    integ = get(op, 'x-amazon-apigateway-integration')
+    if is_obj(integ):
+        items = []
+        for k in ('type', 'httpMethod', 'uri', 'connectionType'):
+            if is_str(get(integ, k)):
+                items.append(k + '=' + integ[k])
+        if items:
+            lines.append('API Gateway 統合: ' + ', '.join(items))
+    if get(op, 'deprecated') is True:
+        lines.append('※ deprecated（非推奨）に指定された API です。')
+    if body is not None and body['kind'] == 'multipart':
+        lines.append('※ multipart/form-data はファイル項目もテキスト値で送信します。実ファイルを送る場合は「ファイルアップロード」タブで設定してください。')
+    if has_data:
+        lines.append('テストデータ: OpenAPI のデータ型定義からランダム生成（乱数シード ' + str(ctx.seed) + '）')
+    return '\n'.join(lines)
+
+
+# JSON 文字列（エスケープ込み）と ${...} を先頭から順に拾う。文字列は読み飛ばし、${...} だけを置き換える。
+# 直後が : の ${...} はキーの位置なので置き換えない（PowerShell 5.1 の JSON 解析は引用符なしのキーを
+# 受け付けてしまい、実装間で結果が変わるため。置き換えなければどの実装でも構文エラーになる）
+PLACEHOLDER_SCAN = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"|\$\{[^{}"\r\n]+\}(?![ \t\r\n]*:)', re.S)
+PLACEHOLDER_LINES_SHOWN = 10
+
+
+def fill_placeholders(text, value):
+    """JSON 文字列の外に引用符なしで書かれた ${...}（後で置換するプレースホルダ）を数値 value に置き換える。
+    文字列の中の ${...}（"${stageVariables.x}" など）は正しい JSON なので変更しない。
+    戻り値: (置換後の文字列, [(プレースホルダ, [行番号, ...]), ...]（初出順）)"""
+    if '${' not in text:
+        return text, []
+    found = OrderedDict()
+    out = []
+    pos = 0
+    line = 1
+    for m in PLACEHOLDER_SCAN.finditer(text):
+        s = m.start()
+        if text[s] != '$':
+            continue    # 文字列（読み飛ばすだけ）
+        line += text.count('\n', pos, s)
+        out.append(text[pos:s])
+        out.append(value)
+        found.setdefault(m.group(0), []).append(line)
+        pos = m.end()
+    out.append(text[pos:])
+    return ''.join(out), list(found.items())
+
+
+def placeholder_warning(name, lines, value):
+    shown = ', '.join(str(n) for n in lines[:PLACEHOLDER_LINES_SHOWN])
+    more = ' ほか' if len(lines) > PLACEHOLDER_LINES_SHOWN else ''
+    return ('引用符なしのプレースホルダ %s は JSON として読めないため、数値 %s に置き換えて読み込みました（%d 箇所・行 %s%s）'
+            % (name, value, len(lines), shown, more))
+
+
+def load_json(path, placeholder_value):
+    with open(path, 'rb') as f:
+        raw = f.read()
+    try:
+        if raw[:3] == b'\xef\xbb\xbf':
+            text = raw[3:].decode('utf-8')
+        elif raw[:2] == b'\xff\xfe':
+            text = raw[2:].decode('utf-16-le')
+        elif raw[:2] == b'\xfe\xff':
+            text = raw[2:].decode('utf-16-be')
+        else:
+            text = raw.decode('utf-8')
+    except UnicodeDecodeError:
+        raise GenError('入力ファイルの文字コードを UTF-8 として読めません: ' + path)
+
+    def bad_constant(name):
+        raise ValueError('JSON では使えない値です: ' + name)
+
+    text, placeholders = fill_placeholders(text, placeholder_value)
+    try:
+        doc = json.loads(text, object_pairs_hook=OrderedDict, parse_float=Decimal, parse_constant=bad_constant)
+    except ValueError as e:
+        raise GenError('JSON の構文エラーです（YAML 形式は未対応です）: ' + str(e))
+    return doc, placeholders
+
+
+_OA_ROW_UNSAFE = re.compile(r'[&%$\x00-\x1f\x7f]')
+
+
+def oa_row_pairs(pairs):
+    # (名前, 値) の並びを API一覧の「名前=値」（改行区切り）の形にする。
+    # 区切り文字（& 改行 =）・%・$・前後の空白を含むものは、名前・値とも URL エンコードして書く
+    out = []
+    for k, v in pairs:
+        if k == k.strip() and v == v.strip() and '=' not in k and not _OA_ROW_UNSAFE.search(k + v):
+            out.append(k + '=' + v)
+            continue
+        ek = oa_pct_encode(k, False)
+        ev = oa_pct_encode(v, False)
+        if '%' not in ev:
+            # 値に %XX が無いと JMeter がエンコード済みの名前をもう一度エンコードするため、値もすべて %XX にする
+            ev = ''.join('%%%02X' % b for b in bytearray(ev.encode('utf-8')))
+        out.append(ek + '=' + ev)
+    return '\n'.join(out)
+
+
+def oa_server_url(doc):
+    # 接続先の既定値: servers[0].url（{変数} は既定値に置換）。http(s) の URL でなければ http://localhost:8080 を前に付ける
+    servers = get(doc, 'servers')
+    srv = servers[0] if is_arr(servers) and len(servers) > 0 and is_obj(servers[0]) else None
+    url = get(srv, 'url')
+    url = url.strip() if is_str(url) else ''
+    variables = get(srv, 'variables')
+
+    def var_default(m):
+        d = get(get(variables, m.group(1)), 'default')
+        return d if is_str(d) else m.group(0)
+    url = PLACEHOLDER_RE.sub(var_default, url).rstrip('/')
+    if re.match(r'^[Hh][Tt][Tt][Pp][Ss]?://', url):
+        return url
+    if url and not url.startswith('/'):
+        url = '/' + url
+    return 'http://localhost:8080' + url
+
+
+def load_openapi(input_path, opts):
+    # OpenAPI 3.0.x 定義（JSON）を読み込み、API一覧（Excel / CSV）と同じ項目の行に変換する
+    # 戻り値: (行の一覧, OpenAPI 定義から求めた設定の既定値 [(設定キー, 値), ...])
+    seed_text = opts.get('seed') or ''
+    if seed_text and not re.match(r'^[0-9]{1,12}\Z', seed_text):
+        raise ToolError('--seed は 0 以上の整数（12 桁以内）で指定してください: ' + seed_text)
+    seed = int(seed_text) if seed_text else int.from_bytes(os.urandom(4), 'big') % 1000000000
+    any_method = (opts.get('any_method') or 'GET').upper()
+    if any_method not in ('GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'):
+        raise ToolError('--any-method は GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS のいずれかです: ' + any_method)
+    placeholder_value = opts.get('placeholder_value') or '3000'
+    if not re.match(r'^-?(0|[1-9][0-9]{0,14})([.][0-9]{1,12})?\Z', placeholder_value):
+        raise ToolError('--placeholder-value は JSON の数値（例: 3000、-1、2.5。整数部 15 桁・小数部 12 桁以内）で指定してください: '
+                        + placeholder_value)
+    doc, placeholders = load_json(input_path, placeholder_value)
+    if not is_obj(doc):
+        raise GenError('OpenAPI 定義のルートが JSON オブジェクトではありません')
+    if has(doc, 'swagger'):
+        raise GenError('Swagger 2.0 形式には対応していません。OpenAPI 3.0.x 形式（"openapi": "3.0.3" など）に変換してください')
+    ver = get(doc, 'openapi')
+    if not is_str(ver) or not re.match(r'^3\.[0-9]+(\.[0-9]+)?', ver):
+        raise GenError('"openapi" フィールドが 3.x ではありません（OpenAPI 3.0.x の JSON を指定してください）')
+    if not ver.startswith('3.0'):
+        warn('OpenAPI %s は 3.0.x 以外です。3.0.x と共通の項目のみを解釈します。' % ver)
+    if not is_obj(get(doc, 'paths')):
+        raise GenError('"paths" が定義されていません')
+    info_obj = get(doc, 'info')
+    title = get(info_obj, 'title')
+    title = title.strip() if is_str(title) and title.strip() else 'OpenAPI'
+    api_version = get(info_obj, 'version')
+    api_version = api_version.strip() if is_str(api_version) and api_version.strip() else '-'
+
+    ctx = Ctx(doc, seed, {'required_only': bool(opts.get('required_only')), 'use_examples': bool(opts.get('use_examples')),
+                          'any_method': any_method})
+    for ph_name, ph_lines in placeholders:
+        ctx.warn(placeholder_warning(ph_name, ph_lines, placeholder_value))
+    ops = collect_operations(ctx)
+    if not ops:
+        raise GenError('"paths" に呼び出し可能な操作（get/post/put/delete など）が 1 件もありません')
+    records = []
+    for idx, op_info in enumerate(ops):
+        name = (('ANY(' + op_info['method'] + ')') if op_info['is_any'] else op_info['method']) + ' ' + op_info['path']
+        op_id = get(op_info['op'], 'operationId')
+        if is_str(op_id) and op_id:
+            name += ' [' + op_id + ']'
+        row = build_operation(ctx, op_info, 'API%02d_%s' % (idx + 1, name))
+        row.update({'no': str(idx + 1), 'enabled': 'Y', 'name': name})
+        rec = {'_row': idx + 1}
+        for c in SPEC['api_columns']:
+            rec[c['key']] = clean(row.get(c['key'], '')).strip()
+        records.append(rec)
+    if needs_auth_header(ctx, ops):
+        ctx.warn('認可（security）が定義された API があります。Authorization ヘッダが必要な場合は、'
+                 '設定 common_headers に指定してください（例: Authorization: Bearer ${AUTH_TOKEN}）')
+    for w in ctx.warnings:
+        warn(w)
+    info('API定義: OpenAPI %s（%s %s、%d 件）' % (ver, title, api_version, len(records)))
+    info('テストデータの乱数シード: %d（--seed %d を指定すると同じテストデータを再生成できます）' % (seed, seed))
+    defaults = [('base_url', oa_server_url(doc)), ('output_file', safe_name(title) + '.jmx'),
+                ('test_plan_name', '%s %s（OpenAPI %s）' % (title, api_version, ver))]
+    return records, defaults
+
+
 # ----------------------------------------------------------------------------- input loading
 def _aliases():
     m = {}
@@ -3043,9 +4724,10 @@ def _find_sheet(sheets, names):
     return None, None
 
 
-def load_input(input_path, settings_path):
+def load_input(input_path, settings_path, opts=None):
     ext = os.path.splitext(input_path)[1].lower()
     raw = None
+    oa_defaults = []
     if ext in ('.xlsx', '.xlsm'):
         sheets = xlsx_read(input_path)
         name, rows = _find_sheet(sheets, [TPL['api_sheet'], 'API', 'APIs', 'api_list'])
@@ -3079,10 +4761,18 @@ def load_input(input_path, settings_path):
                 settings_path = cand
             else:
                 warn('設定 CSV（%s）が無いため、設定はすべて既定値を使用します' % os.path.basename(cand))
+    elif ext == '.json':
+        records, oa_defaults = load_openapi(input_path, opts or {})
+        if not settings_path:
+            cand = os.path.splitext(input_path)[0] + '_settings.csv'
+            if os.path.isfile(cand):
+                settings_path = cand
+            else:
+                info('設定 CSV（%s）が無いため既定値を使用します（接続先などは OpenAPI 定義の値）' % os.path.basename(cand))
     elif ext == '.xls':
         raise ToolError('.xls 形式（Excel 97-2003）には対応していません。Excel で .xlsx 形式で保存し直してください: ' + input_path)
     else:
-        raise ToolError('対応していないファイル形式です（.xlsx / .csv）: ' + input_path)
+        raise ToolError('対応していないファイル形式です（.xlsx / .csv / .json）: ' + input_path)
     if settings_path:
         if not os.path.isfile(settings_path):
             raise ToolError('設定ファイルが見つかりません: ' + settings_path)
@@ -3096,7 +4786,12 @@ def load_input(input_path, settings_path):
             text, enc = read_text(settings_path)
             raw = load_settings_table([(i + 1, r) for i, r in enumerate(parse_csv(text))], os.path.basename(settings_path))
         info('設定: %s' % settings_path)
-    return raw or {}, records
+    raw = raw or {}
+    for key, value in oa_defaults:
+        if not raw.get(key):
+            raw[key] = value
+            info('設定 %s: %s（設定ファイルで未指定のため OpenAPI 定義から設定）' % (key, value))
+    return raw, records
 
 
 def parse_bool(v):
@@ -3344,7 +5039,7 @@ def normalize_api(rec, index, cfg):
     headers = parse_headers(rec['headers'], where)
     body = rec['body']
     bt = rec['body_type'].lower() or 'auto'
-    if bt not in ('auto', 'json', 'form', 'raw', 'xml'):
+    if bt not in ('auto', 'json', 'form', 'raw', 'xml', 'multipart'):
         warn('%s: ボディ形式「%s」は auto / json / form / raw のいずれかで記入してください（auto として扱います）' % (where, rec['body_type']))
         bt = 'auto'
     kind = ''
@@ -3364,7 +5059,7 @@ def normalize_api(rec, index, cfg):
                 kind = 'raw'
         else:
             kind = bt
-    if kind == 'form':
+    if kind in ('form', 'multipart'):
         args = [(k, v, needs_encode(v)) for k, v in split_pairs(body)]
     if kind == 'json':
         body = re.sub(r'("(?:[^"\\]|\\.)*")|\u3000', lambda m: m.group(1) or ' ', body)
@@ -3572,7 +5267,7 @@ def api_node(api, cfg):
               sp('HTTPSampler.contentEncoding', cfg['content_encoding']),
               sp('HTTPSampler.path', api['path']), sp('HTTPSampler.method', api['method']),
               bp('HTTPSampler.follow_redirects', cfg['follow_redirects']), bp('HTTPSampler.auto_redirects', False),
-              bp('HTTPSampler.use_keepalive', cfg['keep_alive']), bp('HTTPSampler.DO_MULTIPART_POST', False),
+              bp('HTTPSampler.use_keepalive', cfg['keep_alive']), bp('HTTPSampler.DO_MULTIPART_POST', api['kind'] == 'multipart'),
               sp('HTTPSampler.embedded_url_re', ''), sp('HTTPSampler.connect_timeout', ''),
               sp('HTTPSampler.response_timeout', '')]
     comment = fill(CM['sampler'], {'ID': aid, 'METHOD': api['method'], 'URL': api['url']})
@@ -3834,7 +5529,7 @@ def cmd_generate(opts):
         raise ToolError('入力ファイルが見つかりません: ' + input_path)
     out_dir = opts.get('out') or 'output'
     info('入力ファイル: ' + input_path)
-    raw, records = load_input(input_path, opts.get('settings'))
+    raw, records = load_input(input_path, opts.get('settings'), opts)
     cfg = resolve_settings(raw)
     apis = []
     for i, rec in enumerate(records):
@@ -3995,8 +5690,10 @@ def main(argv):
         return cmd_init(parse_opts(rest, {'-o': 'out', '--out': 'out'}, {'-f': 'force', '--force': 'force'}))
     if cmd == 'generate':
         return cmd_generate(parse_opts(rest, {'-i': 'input', '--input': 'input', '-s': 'settings', '--settings': 'settings',
-                                              '-o': 'out', '--out': 'out'},
-                                       {'--split': 'split', '-f': 'force', '--force': 'force'}))
+                                              '-o': 'out', '--out': 'out', '--seed': 'seed', '--any-method': 'any_method',
+                                              '--placeholder-value': 'placeholder_value'},
+                                       {'--split': 'split', '-f': 'force', '--force': 'force',
+                                        '--required-only': 'required_only', '--use-examples': 'use_examples'}))
     if cmd == 'manual':
         return cmd_manual(parse_opts(rest, {'-o': 'out', '--out': 'out'}, {}))
     if cmd == '_summary':
