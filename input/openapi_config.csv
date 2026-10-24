@@ -8,10 +8,12 @@ HEADERS,HTTPヘッダ,,（空欄）,全 API に付ける HTTP ヘッダ（共通
 API_HEADERS,各APIのHTTPヘッダ（初期値）,"Accept: application/json
 Transaction-ID: XXXXXXXXX
 Transaction-Class: 1
-User-ID: xxxxxxxx","Accept: application/json
+User-ID: xxxxxxxx
+API-Key: XXXXXXX","Accept: application/json
 Transaction-ID: XXXXXXXXX
 Transaction-Class: 1
-User-ID: xxxxxxxx",OpenAPI 定義から生成する各 API のヘッダ（API ごとの HTTP Header Manager）の初期値（生成後に JMeter で API ごとに変更できます）。「名前: 値」を改行区切り。OpenAPI 定義から求めた同じ名前のヘッダ（Accept など）はこちらの値を使います。空欄 = 既定値。付けない場合は「なし」と記入
+User-ID: xxxxxxxx
+API-Key: XXXXXXX",OpenAPI 定義から生成する各 API のヘッダ（API ごとの HTTP Header Manager）の初期値（生成後に JMeter で API ごとに変更できます）。「名前: 値」を改行区切り。OpenAPI 定義から求めた同じ名前のヘッダ（Accept など）はこちらの値を使います。空欄 = 既定値。付けない場合は「なし」と記入
 #■ アクセストークン,,,,
 TOKEN_DIR,アクセストークンのフォルダ,,（空欄）,指定すると、共通ヘッダに Authorization: Bearer ${ACCESS_TOKEN} を追加し、JMeter の実行中に API を呼び出すたびに、このフォルダ直下の拡張子 .token のファイルのうち更新日時が最も新しいファイルの内容を ${ACCESS_TOKEN} に設定します（HEADERS に Authorization を書いた場合はその値を使用）。区切りは \ と / のどちらでも可、相対パスは JMX のフォルダ基準。Windows と Linux のフォルダを ; で区切って書くと、存在する方を使います（例: C:\work\tokens;/home/user/tokens）。実行時は -JACCESS_TOKEN_DIR=フォルダ で変更できます
 #■ OpenAPI定義の変数,,,,

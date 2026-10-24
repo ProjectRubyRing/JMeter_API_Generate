@@ -692,7 +692,7 @@ $script:SpecJson = @'
    "category": "HTTPヘッダ",
    "key": "API_HEADERS",
    "label": "各APIのHTTPヘッダ（初期値）",
-   "default": "Accept: application/json\nTransaction-ID: XXXXXXXXX\nTransaction-Class: 1\nUser-ID: xxxxxxxx",
+   "default": "Accept: application/json\nTransaction-ID: XXXXXXXXX\nTransaction-Class: 1\nUser-ID: xxxxxxxx\nAPI-Key: XXXXXXX",
    "desc": "OpenAPI 定義から生成する各 API のヘッダ（API ごとの HTTP Header Manager）の初期値（生成後に JMeter で API ごとに変更できます）。「名前: 値」を改行区切り。OpenAPI 定義から求めた同じ名前のヘッダ（Accept など）はこちらの値を使います。空欄 = 既定値。付けない場合は「なし」と記入"
   },
   {
@@ -4549,7 +4549,7 @@ function New-OperationRequest($info, [string]$Label) {
         $lname = $name.ToLowerInvariant()
         if ($script:SKIP_HEADERS -ccontains $lname) { continue }
         if ($lname -ceq 'api-key') {
-            Add-Warn ('{0}: ヘッダ {1} は API キーの実値が必要なため生成しません（設定 common_headers に「{1}: キーの値」を指定してください）' -f $Label, $name)
+            Add-Warn ('{0}: ヘッダ {1} は API キーの実値が必要なため生成しません（OpenAPI 用設定ファイル（-OpenApiConfig）の API_HEADERS に「{1}: キーの値」を指定してください）' -f $Label, $name)
             continue
         }
         if ($script:MANAGED_HEADERS -ccontains $lname) {
