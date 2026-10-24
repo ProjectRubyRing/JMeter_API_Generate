@@ -679,7 +679,7 @@ $script:SpecJson = @'
    "key": "PORT",
    "label": "ポート番号",
    "default": "",
-   "desc": "共通変数 PORT の既定値（1～65535）。空欄 = OpenAPI 定義（servers[0].url）または設定 base_url の値（servers が無い場合は 8080。HOST を変える場合は PORT も指定してください）。実行時は -JPORT=値 で変更できます"
+   "desc": "共通変数 PORT の既定値（1～65535）。空欄 = 未設定（ポート番号なし。http は 80 / https は 443 で接続）。PROTOCOL と HOST も空欄の場合は OpenAPI 定義（servers[0].url）または設定 base_url の値。実行時は -JPORT=値 で変更できます"
   },
   {
    "category": "HTTPヘッダ",
@@ -4897,7 +4897,7 @@ function Load-OaConfig([string]$path) {
     return ,$conf
 }
 function Apply-OaConfig($raw, $conf, [string]$outDir) {
-    # 接続先: 指定した項目だけ base_url を置き換える（空欄の項目は OpenAPI 定義・設定ファイルの値のまま）
+    # 接続先: 指定した項目だけ base_url を置き換える（空欄の PROTOCOL / HOST は OpenAPI 定義・設定ファイルの値のまま、空欄の PORT は未設定）
     $proto = (Get-OaConf $conf 'PROTOCOL').ToLowerInvariant()
     $hostName = Get-OaConf $conf 'HOST'
     $port = Get-OaConf $conf 'PORT'
@@ -4922,7 +4922,6 @@ function Apply-OaConfig($raw, $conf, [string]$outDir) {
         if ($m.Success -and $null -ne $p) {
             if (-not $proto) { $proto = $p.scheme }
             if (-not $hostName) { $hostName = $p.host }
-            if (-not $port) { $port = $p.port }
             $url = $proto + '://' + $hostName
             if ($port) { $url += ':' + $port }
             $raw['base_url'] = $url + $base.Substring($m.Groups[2].Index + $m.Groups[2].Length)

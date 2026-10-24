@@ -798,7 +798,7 @@ SPEC = json.loads(r'''{
    "key": "PORT",
    "label": "ポート番号",
    "default": "",
-   "desc": "共通変数 PORT の既定値（1～65535）。空欄 = OpenAPI 定義（servers[0].url）または設定 base_url の値（servers が無い場合は 8080。HOST を変える場合は PORT も指定してください）。実行時は -JPORT=値 で変更できます"
+   "desc": "共通変数 PORT の既定値（1～65535）。空欄 = 未設定（ポート番号なし。http は 80 / https は 443 で接続）。PROTOCOL と HOST も空欄の場合は OpenAPI 定義（servers[0].url）または設定 base_url の値。実行時は -JPORT=値 で変更できます"
   },
   {
    "category": "HTTPヘッダ",
@@ -4736,7 +4736,7 @@ def load_oa_config(path):
 
 
 def apply_oa_config(raw, conf, out_dir):
-    # 接続先: 指定した項目だけ base_url を置き換える（空欄の項目は OpenAPI 定義・設定ファイルの値のまま）
+    # 接続先: 指定した項目だけ base_url を置き換える（空欄の PROTOCOL / HOST は OpenAPI 定義・設定ファイルの値のまま、空欄の PORT は未設定）
     proto, host, port = conf.get('PROTOCOL', '').lower(), conf.get('HOST', ''), conf.get('PORT', '')
     if proto not in ('', 'http', 'https'):
         warn('OpenAPI 用設定 PROTOCOL: 「%s」は http / https ではないため無視します' % conf['PROTOCOL'])
@@ -4754,7 +4754,6 @@ def apply_oa_config(raw, conf, out_dir):
         m = _URL_RE.match(base)
         p = parse_url(base)
         if m and p:
-            port = port or p['port']
             raw['base_url'] = (proto or p['scheme']) + '://' + (host or p['host']) + (':' + port if port else '') + base[m.end(2):]
             info('設定 base_url: %s（OpenAPI 用設定の PROTOCOL / HOST / PORT を反映）' % raw['base_url'])
     # HTTP ヘッダ: 共通ヘッダに追加し、同じ名前のヘッダは置き換える。TOKEN_DIR があれば Authorization: Bearer ${ACCESS_TOKEN}

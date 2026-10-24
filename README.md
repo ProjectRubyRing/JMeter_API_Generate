@@ -79,7 +79,7 @@ OpenAPI 定義から生成する場合だけ使う設定ファイルです。`in
 
 | 設定キー | 内容 |
 |---|---|
-| `PROTOCOL` / `HOST` / `PORT` | 共通変数（User Defined Variables）PROTOCOL / HOST / PORT の既定値。記入した項目だけ `base_url`（`servers[0].url`）の接続先を置き換え、パス（例: `/v1`）はそのまま使います。servers が無い場合の既定は `http://localhost:8080` のため、HOST を変える場合は PORT も指定してください。実行時の `-JPROTOCOL=` `-JHOST=` `-JPORT=` も従来どおり使えます |
+| `PROTOCOL` / `HOST` / `PORT` | 共通変数（User Defined Variables）PROTOCOL / HOST / PORT の既定値。記入した項目だけ `base_url`（`servers[0].url`）の接続先を置き換え、パス（例: `/v1`）はそのまま使います。PORT が空欄の場合はポート番号を付けないため（未設定。http は 80 / https は 443 で接続）、ホスト名だけでも指定できます（3 項目とも空欄なら `base_url` のまま）。実行時の `-JPROTOCOL=` `-JHOST=` `-JPORT=` も従来どおり使えます |
 | `HEADERS` | 全 API に付ける HTTP ヘッダ（「名前: 値」を改行区切り。例: `X-Api-Key: キーの値`）。共通ヘッダ（HTTP Header Manager）に追加し、設定 `common_headers` と同じ名前のヘッダはこちらを使います |
 | `TOKEN_DIR` | アクセストークンのフォルダ。指定すると共通ヘッダに `Authorization: Bearer ${ACCESS_TOKEN}` を追加し、JMeter の実行中に API を呼び出すたびに、このフォルダ直下の `*.token` のうち **更新日時が最も新しいファイル** の内容（前後の空白・改行・BOM を除く）を `${ACCESS_TOKEN}` に設定します（`HEADERS` に Authorization を書いた場合はその値を使用） |
 
