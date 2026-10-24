@@ -147,6 +147,7 @@ input フォルダに次の 3 ファイルが作成されます（既存ファ�
 | -i ファイル | -InputFile（-i） | 入力ファイル（.xlsx / .csv）。必須 |
 | -s ファイル | -SettingsFile（-s） | 設定 CSV。省略時は「入力ファイル名_settings.csv」を探し、無ければ既定値を使用（Excel 入力時は「設定」シートを使用） |
 | -o フォルダ | -OutDir（-o） | 出力先フォルダ（既定: output） |
+| -n ファイル名 | -JmxName（-n） | 出力する JMX のファイル名（例: order_test.jmx）。設定「出力JMXファイル名」（output_file）より優先します |
 | --split | -Split | API ごとに別々の JMX を出力する |
 | -f | -Force（-f） | サンプルデータ（data/testdata.csv / .xlsx）が既にあっても上書きする |
 
@@ -663,7 +664,7 @@ log.info('order id = ' + vars.get('ORDER_ID'))
 | コマンド | RHEL 9.8（sh） | Windows 11（bat / ps1） | 説明 |
 |---|---|---|---|
 | init | `./jmeter_api_tool.sh init [-o フォルダ] [-f]` | `jmeter_api_tool.bat init [-OutDir フォルダ] [-Force]` | 入力テンプレートを作成（既定: input） |
-| generate | `./jmeter_api_tool.sh generate -i ファイル [-s 設定CSV] [-o フォルダ] [--split] [-f]` | `jmeter_api_tool.bat generate -i ファイル [-s 設定CSV] [-OutDir フォルダ] [-Split] [-Force]` | JMX を生成（既定: output） |
+| generate | `./jmeter_api_tool.sh generate -i ファイル [-s 設定CSV] [-o フォルダ] [-n ファイル名] [--split] [-f]` | `jmeter_api_tool.bat generate -i ファイル [-s 設定CSV] [-OutDir フォルダ] [-JmxName ファイル名] [-Split] [-Force]` | JMX を生成（既定: output） |
 | manual | `./jmeter_api_tool.sh manual [-o フォルダ]` | `jmeter_api_tool.bat manual [-OutDir フォルダ]` | 本書（xlsx / md）を出力（既定: docs） |
 | run | `./jmeter_api_tool.sh run -t JMX [オプション]` | `jmeter_api_tool.bat run -t JMX [オプション]` | CLI モードで実行（既定: result） |
 | help | `./jmeter_api_tool.sh help` | `jmeter_api_tool.bat help` | ヘルプを表示 |

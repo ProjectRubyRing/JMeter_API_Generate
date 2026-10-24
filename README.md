@@ -29,6 +29,7 @@ REST API の定義（URL・HTTP メソッド・クエリパラメータ・ヘッ
 chmod +x jmeter_api_tool.sh
 ./jmeter_api_tool.sh init                                   # 入力テンプレートを作成（input/）
 ./jmeter_api_tool.sh generate -i input/api_definition.xlsx  # JMX を生成（output/）
+./jmeter_api_tool.sh generate -i input/api_definition.xlsx -n order_test.jmx   # 出力する JMX のファイル名を指定
 ./jmeter_api_tool.sh generate -i openapi.json --seed 12345  # OpenAPI 定義（JSON）から JMX を生成
 ./jmeter_api_tool.sh run -t output/api_test.jmx             # CLI 実行（result/JMX名_日時/）
 ./jmeter_api_tool.sh run -t output/api_test.jmx --threads 10 --loops 100   # 大量実行
@@ -40,6 +41,7 @@ chmod +x jmeter_api_tool.sh
 ```powershell
 .\jmeter_api_tool.bat init
 .\jmeter_api_tool.bat generate -i input\api_definition.xlsx
+.\jmeter_api_tool.bat generate -i input\api_definition.xlsx -JmxName order_test.jmx
 .\jmeter_api_tool.bat generate -i openapi.json -Seed 12345
 .\jmeter_api_tool.bat run -t output\api_test.jmx
 .\jmeter_api_tool.bat run -t output\api_test.jmx -Threads 10 -Loops 100
@@ -62,7 +64,7 @@ chmod +x jmeter_api_tool.sh
 | 期待ステータス | 2xx の応答コード（`2XX` だけの場合は空欄） |
 | 備考 | 概要・説明・operationId・認可（security）・API Gateway 統合など |
 
-- 設定は Excel / CSV と同じく `-s` または「入力ファイル名_settings.csv」から読み込みます。設定ファイルで空欄の `base_url`（`servers[0].url`。無い場合は `http://localhost:8080`）、`test_plan_name`、`output_file`（`<タイトル>.jmx`）は OpenAPI 定義の値を使います。
+- 設定は Excel / CSV と同じく `-s` または「入力ファイル名_settings.csv」から読み込みます。設定ファイルで空欄の `base_url`（`servers[0].url`。無い場合は `http://localhost:8080`）、`test_plan_name`、`output_file`（`<タイトル>.jmx`）は OpenAPI 定義の値を使います（`output_file` は `-n` / `-JmxName` を指定するとその値が優先）。
 - 認証ヘッダ（Authorization・API-Key）はランダム値では通らないため生成しません。設定 `common_headers` に指定してください。
 - OpenAPI 用のオプション（sh / PowerShell）: `--seed` / `-Seed`（乱数シード）、`--any-method` / `-AnyMethod`、`--required-only` / `-RequiredOnly`、`--use-examples` / `-UseExamples`、`--placeholder-value` / `-PlaceholderValue`（意味は JMeter_Tools と同じ）。
 - GET / DELETE のリクエストボディは Excel / CSV と同じ規則で送信しません（警告を表示）。YAML・Swagger 2.0・外部ファイルへの `$ref` は対象外です。
