@@ -24,7 +24,7 @@
 | input/api_definition.xlsx | 入力テンプレート（Excel）：「API一覧」「設定」「記入方法」シート |
 | input/api_definition.csv | 入力テンプレート（CSV）：API 一覧 |
 | input/api_definition_settings.csv | 入力テンプレート（CSV）：設定 |
-| input/openapi_config.csv | OpenAPI 定義（.json）から生成する場合の設定（接続先・HTTP ヘッダ・アクセストークン）。generate の -c / -OpenApiConfig で指定 |
+| input/openapi_config.csv | OpenAPI 定義（.json）から生成する場合の設定（接続先・HTTP ヘッダ・アクセストークン・定義の変数 ${public_base_url} / ${name_prefix} の値）。generate の -c / -OpenApiConfig で指定 |
 | output/api_test.jmx | 生成された JMX（サンプル） |
 | output/data/testdata.csv | CSV データ読込のサンプルデータ |
 | output/data/testdata.xlsx | Excel データ読込のサンプルデータ |
@@ -121,7 +121,7 @@ input フォルダに次の 4 ファイルが作成されます（既存ファ�
 - api_definition.xlsx（Excel 形式のテンプレート）
 - api_definition.csv（CSV 形式：API 一覧）
 - api_definition_settings.csv（CSV 形式：設定）
-- openapi_config.csv（CSV 形式：OpenAPI 定義から生成する場合の接続先・HTTP ヘッダ・アクセストークン。generate の -c / -OpenApiConfig で指定）
+- openapi_config.csv（CSV 形式：OpenAPI 定義から生成する場合の接続先・HTTP ヘッダ・アクセストークン・定義の変数 ${public_base_url} / ${name_prefix} の値。generate の -c / -OpenApiConfig で指定）
 
 ### 手順2：API 定義を記入する
 - Excel 形式：「API一覧」シートに 1行 = 1API で記入し、「設定」シートの「設定値」列で全体設定を変更します。

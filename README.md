@@ -17,7 +17,7 @@ REST API の定義（URL・HTTP メソッド・クエリパラメータ・ヘッ
 | `jmeter_api_tool.ps1` / `jmeter_api_tool.bat` | Windows 11 用スクリプト / 起動ファイル（実行ポリシーを回避して .ps1 を起動） |
 | `input/api_definition.xlsx` | 入力テンプレート（Excel）：「API一覧」「設定」「記入方法」シート |
 | `input/api_definition.csv` / `input/api_definition_settings.csv` | 入力テンプレート（CSV）：API 一覧 / 設定 |
-| `input/openapi_config.csv` | OpenAPI 用設定ファイルのテンプレート：接続先（PROTOCOL / HOST / PORT）・HTTP ヘッダ・アクセストークンのフォルダ |
+| `input/openapi_config.csv` | OpenAPI 用設定ファイルのテンプレート：接続先（PROTOCOL / HOST / PORT）・HTTP ヘッダ・アクセストークンのフォルダ・OpenAPI 定義の変数（PUBLIC_BASE_URL / NAME_PREFIX） |
 | `output/api_test.jmx` | テンプレートの記入例から生成した JMX（サンプル） |
 | `output/data/testdata.csv` / `testdata.xlsx` | CSV / Excel データ読込のサンプルデータ |
 | `docs/JMeter_Usage_Guide.xlsx` / `.md` | 利用方法（manual コマンドで再出力できます） |
@@ -68,6 +68,7 @@ chmod +x jmeter_api_tool.sh
 | 備考 | 概要・説明・operationId・認可（security）・API Gateway 統合など |
 
 - 設定は Excel / CSV と同じく `-s` または「入力ファイル名_settings.csv」から読み込みます。設定ファイルで空欄の `base_url`（`servers[0].url`。無い場合は `http://localhost:8080`）、`test_plan_name`、`output_file`（`<タイトル>.jmx`）は OpenAPI 定義の値を使います（`output_file` は `-n` / `-JmxName` を指定するとその値が優先）。
+- `servers[0].url` のプレースホルダ `${public_base_url}` とタイトル（`info.title`）の `${name_prefix}` は、OpenAPI 用設定ファイルの `PUBLIC_BASE_URL` / `NAME_PREFIX` の値に置き換えます。未設定（既定）の場合は取り除くため、パスの先頭（コンテキストルート）やテストプラン名・JMX のファイル名に `${...}` は残りません（例: `${name_prefix}-orders-api` → `orders-api`）。
 - 認証ヘッダ（Authorization・API-Key）はランダム値では通らないため生成しません。設定 `common_headers`、または下記の OpenAPI 用設定ファイル（`HEADERS` / `TOKEN_DIR`）で指定してください。
 - OpenAPI 用のオプション（sh / PowerShell）: `-c` / `-OpenApiConfig`（OpenAPI 用設定ファイル。下記）、`--seed` / `-Seed`（乱数シード）、`--any-method` / `-AnyMethod`、`--required-only` / `-RequiredOnly`、`--use-examples` / `-UseExamples`、`--placeholder-value` / `-PlaceholderValue`（意味は JMeter_Tools と同じ）。
 - GET / DELETE のリクエストボディは Excel / CSV と同じ規則で送信しません（警告を表示）。YAML・Swagger 2.0・外部ファイルへの `$ref` は対象外です。
@@ -82,10 +83,13 @@ OpenAPI 定義から生成する場合だけ使う設定ファイルです。`in
 | `PROTOCOL` / `HOST` / `PORT` | 共通変数（User Defined Variables）PROTOCOL / HOST / PORT の既定値。記入した項目だけ `base_url`（`servers[0].url`）の接続先を置き換え、パス（例: `/v1`）はそのまま使います。PORT が空欄の場合はポート番号を付けないため（未設定。http は 80 / https は 443 で接続）、ホスト名だけでも指定できます（3 項目とも空欄なら `base_url` のまま）。実行時の `-JPROTOCOL=` `-JHOST=` `-JPORT=` も従来どおり使えます |
 | `HEADERS` | 全 API に付ける HTTP ヘッダ（「名前: 値」を改行区切り。例: `X-Api-Key: キーの値`）。共通ヘッダ（HTTP Header Manager）に追加し、設定 `common_headers` と同じ名前のヘッダはこちらを使います |
 | `TOKEN_DIR` | アクセストークンのフォルダ。指定すると共通ヘッダに `Authorization: Bearer ${ACCESS_TOKEN}` を追加し、JMeter の実行中に API を呼び出すたびに、このフォルダ直下の `*.token` のうち **更新日時が最も新しいファイル** の内容（前後の空白・改行・BOM を除く）を `${ACCESS_TOKEN}` に設定します（`HEADERS` に Authorization を書いた場合はその値を使用） |
+| `PUBLIC_BASE_URL` | OpenAPI 定義の `servers[0].url` のプレースホルダ `${public_base_url}` に入れる値。URL（例: `https://api.example.com/v1`）は接続先とパスの先頭に、パス（例: `/v1`）はパスの先頭（コンテキストルート）に使います（`PROTOCOL` / `HOST` / `PORT` を記入した場合は、その項目だけさらに置き換え）。空欄（既定）は未設定とし、`${public_base_url}` を取り除いてパスに付けません |
+| `NAME_PREFIX` | OpenAPI 定義のタイトル（`info.title`）のプレースホルダ `${name_prefix}` に入れる値（例: `dev` → テストプラン名 `dev-orders-api 1.0.0（OpenAPI 3.0.1）`、JMX `dev-orders-api.jmx`）。空欄（既定）は未設定とし、`${name_prefix}` を隣の区切り文字（`-` `_` `.` `/` 空白）ごと取り除きます |
 
 - `TOKEN_DIR` の書き方（Windows / Linux 共通）: 区切りは `\` と `/` のどちらでも可。相対パスは JMX のフォルダ基準（例: `tokens`、`..\tokens`）。Windows と Linux のフォルダを `;` で区切って書くと、実行する環境に存在する方を使うため、同じ JMX を両方で使えます（例: `C:\work\tokens;/home/user/tokens`）。実行時に `-JACCESS_TOKEN_DIR=フォルダ` で変更することもできます。
 - トークンは JMX には書き込まず、JMeter の実行時に読み込みます。新しい `.token` ファイルを置く・ファイルを書き換えると、実行中でも次の API 呼び出しから切り替わります（フォルダの確認は 1 秒に 1 回）。拡張子が `.token` 以外のファイルは使いません。
 - 生成時には、そのとき最新の `.token` ファイル（またはフォルダ・ファイルが無いことの警告）を表示します。
+- `PUBLIC_BASE_URL` / `NAME_PREFIX` は OpenAPI 定義（`servers[0].url`・タイトル）に入れる値のため、設定ファイル（`-s`）で `base_url` / `test_plan_name` / `output_file` を指定した場合は、その設定の値を使います。
 
 ## 生成される JMX の主な内容
 
