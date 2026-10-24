@@ -809,6 +809,13 @@ SPEC = json.loads(r'''{
    "desc": "全 API に付ける HTTP ヘッダ（共通ヘッダの HTTP Header Manager に追加）。「名前: 値」を改行区切り（例: X-Api-Key: キーの値）。設定 common_headers と同じ名前のヘッダはこちらを使います"
   },
   {
+   "category": "HTTPヘッダ",
+   "key": "API_HEADERS",
+   "label": "各APIのHTTPヘッダ（初期値）",
+   "default": "Accept: application/json\nTransaction-ID: XXXXXXXXX\nTransaction-Class: 1\nUser-ID: xxxxxxxx",
+   "desc": "OpenAPI 定義から生成する各 API のヘッダ（API ごとの HTTP Header Manager）の初期値（生成後に JMeter で API ごとに変更できます）。「名前: 値」を改行区切り。OpenAPI 定義から求めた同じ名前のヘッダ（Accept など）はこちらの値を使います。空欄 = 既定値。付けない場合は「なし」と記入"
+  },
+  {
    "category": "アクセストークン",
    "key": "TOKEN_DIR",
    "label": "アクセストークンのフォルダ",
@@ -4754,6 +4761,7 @@ def load_openapi(input_path, opts):
 #   PROTOCOL / HOST / PORT → base_url の接続先（パス以降はそのまま）、HEADERS → common_headers、
 #   TOKEN_DIR → access_token_dir / access_token_file（フォルダ直下の *.token のうち更新日時が最も新しいファイル）
 #   PUBLIC_BASE_URL / NAME_PREFIX → OpenAPI 定義の ${public_base_url}（servers[0].url）/ ${name_prefix}（info.title）の値（oa_fill_vars）
+#   API_HEADERS → 各 API のヘッダ（API一覧の「ヘッダ」。-c を指定しない場合・空欄は既定値。add_oa_api_headers）
 TOKEN_PATTERN = '*.token'
 
 
@@ -4840,6 +4848,24 @@ def check_token_dir(dir_text, pattern, base_dir):
     info('アクセストークン: 現在の最新ファイル %s（更新日時 %s。%s は %d 件）'
          % (os.path.join(found[0], newest),
             datetime.datetime.fromtimestamp(stamp(newest)[0] / 1000.0).strftime('%Y-%m-%d %H:%M:%S'), pattern, len(files)))
+
+
+def add_oa_api_headers(records, conf):
+    # 各 API のヘッダ（API ごとの HTTP Header Manager）の初期値: OpenAPI 用設定 API_HEADERS（-c を指定しない場合・空欄は既定値、「なし」は付けない）。
+    # OpenAPI 定義から求めた同じ名前のヘッダ（Accept など）は置き換え、API一覧の「ヘッダ」の後ろに追加する
+    text = (conf or {}).get('API_HEADERS', '')
+    where = 'OpenAPI 用設定 API_HEADERS'
+    if not text:
+        text = [c['default'] for c in SPEC['openapi_config'] if c['key'] == 'API_HEADERS'][0]
+        where += ' の既定値'
+    add = [] if parse_onoff(text) == 'OFF' else parse_headers(text, where)
+    if not add:
+        return
+    names = [k.lower() for k, v in add]
+    for rec in records:
+        kept = [x for x in rec['headers'].split('\n') if x.strip() and x.split(':', 1)[0].strip().lower() not in names]
+        rec['headers'] = '\n'.join(kept + [k + ': ' + v for k, v in add])
+    info('各 API のヘッダ: %s（%s。OpenAPI 定義から求めた同じ名前のヘッダは置き換え）' % (', '.join(k for k, v in add), where))
 
 
 # ----------------------------------------------------------------------------- input loading
@@ -4960,9 +4986,10 @@ def load_input(input_path, settings_path, opts=None):
         opts = opts or {}
         if opts.get('oa_config'):
             oa_conf = load_oa_config(opts['oa_config'])
-            opts['_oa_auth'] = bool(oa_conf.get('TOKEN_DIR')) or bool(re.search(r'(?im)^\s*authorization\s*:', oa_conf.get('HEADERS', '')))
+            opts['_oa_auth'] = bool(oa_conf.get('TOKEN_DIR')) or bool(re.search(r'(?im)^\s*authorization\s*:', oa_conf.get('HEADERS', '') + '\n' + oa_conf.get('API_HEADERS', '')))
             opts['_oa_conf'] = oa_conf
         records, oa_defaults = load_openapi(input_path, opts or {})
+        add_oa_api_headers(records, oa_conf)
         if not settings_path:
             cand = os.path.splitext(input_path)[0] + '_settings.csv'
             if os.path.isfile(cand):

@@ -689,6 +689,13 @@ $script:SpecJson = @'
    "desc": "全 API に付ける HTTP ヘッダ（共通ヘッダの HTTP Header Manager に追加）。「名前: 値」を改行区切り（例: X-Api-Key: キーの値）。設定 common_headers と同じ名前のヘッダはこちらを使います"
   },
   {
+   "category": "HTTPヘッダ",
+   "key": "API_HEADERS",
+   "label": "各APIのHTTPヘッダ（初期値）",
+   "default": "Accept: application/json\nTransaction-ID: XXXXXXXXX\nTransaction-Class: 1\nUser-ID: xxxxxxxx",
+   "desc": "OpenAPI 定義から生成する各 API のヘッダ（API ごとの HTTP Header Manager）の初期値（生成後に JMeter で API ごとに変更できます）。「名前: 値」を改行区切り。OpenAPI 定義から求めた同じ名前のヘッダ（Accept など）はこちらの値を使います。空欄 = 既定値。付けない場合は「なし」と記入"
+  },
+  {
    "category": "アクセストークン",
    "key": "TOKEN_DIR",
    "label": "アクセストークンのフォルダ",
@@ -4910,6 +4917,7 @@ function Load-OpenApi([string]$inputPath) {
 #   PROTOCOL / HOST / PORT → base_url の接続先（パス以降はそのまま）、HEADERS → common_headers、
 #   TOKEN_DIR → access_token_dir / access_token_file（フォルダ直下の *.token のうち更新日時が最も新しいファイル）
 #   PUBLIC_BASE_URL / NAME_PREFIX → OpenAPI 定義の ${public_base_url}（servers[0].url）/ ${name_prefix}（info.title）の値（Resolve-OaVars）
+#   API_HEADERS → 各 API のヘッダ（API一覧の「ヘッダ」。-OpenApiConfig を指定しない場合・空欄は既定値。Add-OaApiHeaders）
 $script:TokenPattern = '*.token'
 $script:OaAuth = $false
 $script:OaConf = $null
@@ -5034,6 +5042,32 @@ function Check-TokenDir([string]$dirText, [string]$pattern, [string]$baseDir) {
         return
     }
     Write-Info ('アクセストークン: 現在の最新ファイル ' + $best.FullName + '（更新日時 ' + $best.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss', $script:Inv) + '。' + $pattern + ' は ' + $count + ' 件）')
+}
+function Add-OaApiHeaders($records, $conf) {
+    # 各 API のヘッダ（API ごとの HTTP Header Manager）の初期値: OpenAPI 用設定 API_HEADERS（-OpenApiConfig を指定しない場合・空欄は既定値、「なし」は付けない）。
+    # OpenAPI 定義から求めた同じ名前のヘッダ（Accept など）は置き換え、API一覧の「ヘッダ」の後ろに追加する
+    $text = ''
+    if ($null -ne $conf) { $text = Get-OaConf $conf 'API_HEADERS' }
+    $where = 'OpenAPI 用設定 API_HEADERS'
+    if (-not $text) {
+        foreach ($c in $script:Spec.openapi_config) { if ($c.key -ceq 'API_HEADERS') { $text = [string]$c.default } }
+        $where += ' の既定値'
+    }
+    if ((Parse-OnOff $text) -ceq 'OFF') { return }
+    $add = Parse-Headers $text $where
+    if ($add.Count -eq 0) { return }
+    $names = New-Object System.Collections.Generic.List[string]
+    $shown = New-Object System.Collections.Generic.List[string]
+    foreach ($h in $add) { $names.Add(([string]$h[0]).ToLowerInvariant()); $shown.Add([string]$h[0]) }
+    foreach ($rec in $records) {
+        $lines = New-Object System.Collections.Generic.List[string]
+        foreach ($x in ([string]$rec['headers']).Split([char]10)) {
+            if ($x.Trim() -and -not $names.Contains($x.Split([char]':', 2)[0].Trim().ToLowerInvariant())) { $lines.Add($x) }
+        }
+        foreach ($h in $add) { $lines.Add([string]$h[0] + ': ' + [string]$h[1]) }
+        $rec['headers'] = [string]::Join("`n", $lines)
+    }
+    Write-Info ('各 API のヘッダ: ' + ($shown.ToArray() -join ', ') + '（' + $where + '。OpenAPI 定義から求めた同じ名前のヘッダは置き換え）')
 }
 
 # ----------------------------------------------------------------------------- input loading
@@ -5165,12 +5199,13 @@ function Load-Input([string]$inputPath, [string]$settingsPath) {
     } elseif ($ext -ceq '.json') {
         if ($OpenApiConfig) {
             $oaConf = Load-OaConfig $OpenApiConfig
-            $script:OaAuth = [bool](Get-OaConf $oaConf 'TOKEN_DIR') -or ((Get-OaConf $oaConf 'HEADERS') -match '(?im)^\s*authorization\s*:')
+            $script:OaAuth = [bool](Get-OaConf $oaConf 'TOKEN_DIR') -or (((Get-OaConf $oaConf 'HEADERS') + "`n" + (Get-OaConf $oaConf 'API_HEADERS')) -match '(?im)^\s*authorization\s*:')
             $script:OaConf = $oaConf
         }
         $oa = Load-OpenApi $inputPath
         $records = $oa[0]
         $oaDefaults = $oa[1]
+        Add-OaApiHeaders $records $oaConf
         if (-not $settingsPath) {
             $cand = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($inputPath), [System.IO.Path]::GetFileNameWithoutExtension($inputPath) + '_settings.csv')
             if (Test-Path -LiteralPath $cand -PathType Leaf) { $settingsPath = $cand }
