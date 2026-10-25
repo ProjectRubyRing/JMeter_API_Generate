@@ -1,5 +1,20 @@
 # JMeter API テスト JMX 生成ツール（jmeter_api_tool）
 
+このフォルダは [ProjectRubyRing/JMeter_API_Generate](https://github.com/ProjectRubyRing/JMeter_API_Generate) を基にした別系統（v1.1.0）です。Excel / CSV と OpenAPI は同じ内部モデルを経て JMX になります。
+
+v1.1.0 で直した点:
+
+- OpenAPI のクエリ（deepObject、spaceDelimited、pipeDelimited、explode しない配列）を Excel の「名前=値」文字列に潰さず、JMeter の引数へ渡します。deepObject の `[]` と区切り文字を二重エンコードしません。
+- パスパラメータの `simple` / `label` / `matrix` と `allowReserved` を反映します。
+- operation または path の `servers` を、ドキュメントの `servers` と違うときだけその API の接続先にします。設定の `base_url` はドキュメント側の接続先を上書きします。
+- OpenAPI の `cookie` は `Cookie` ヘッダにせず、その API の Cookie Manager にします（共通のクッキー管理と二重送信になりません）。
+- API キー（security の apiKey、ヘッダ名 `api-key`）はランダム値にせずプレースホルダ `XXXXXXX` にします。
+- `-RequiredOnly` は任意の requestBody を出しません。
+- 既定の `API_HEADERS` は、定義から求めた `Accept` や `Content-Type` を置き換えません。既定値と違う値を書いたときだけ置き換えます。
+- OpenAPI 用設定の `PORT` が空欄のときは元のポートを維持します。ポートを消す場合は `default` と記入します。
+- HEAD のクエリは GET と同じく Parameters に置きます。multipart の項目は URL エンコードしません。
+- XML のリクエストはボディ形式 `xml` として送ります。
+
 REST API の定義（URL・HTTP メソッド・クエリパラメータ・ヘッダ・リクエストボディ）を **Excel または CSV** に記入するか、**OpenAPI 定義（JSON）** を指定すると、
 **Apache JMeter 5.6.3** 用の JMX ファイルを自動生成し、CLI モードで実行して JTL・HTML レポート・ログを出力するツールです。
 
@@ -21,6 +36,7 @@ REST API の定義（URL・HTTP メソッド・クエリパラメータ・ヘッ
 | `output/api_test.jmx` | テンプレートの記入例から生成した JMX（サンプル） |
 | `output/data/testdata.csv` / `testdata.xlsx` | CSV / Excel データ読込のサンプルデータ |
 | `docs/JMeter_Usage_Guide.xlsx` / `.md` | 利用方法（manual コマンドで再出力できます） |
+| `docs/JMeter_Scenario_Customization_Guide.xlsx` | JMeterシナリオ構築 実践マニュアル（API依存関係・CSV読込・乱数・ループ等） |
 
 ## クイックスタート
 
@@ -29,7 +45,13 @@ REST API の定義（URL・HTTP メソッド・クエリパラメータ・ヘッ
 ```bash
 chmod +x jmeter_api_tool.sh
 ./jmeter_api_tool.sh init                                   # 入力テンプレートを作成（input/）
-./jmeter_api_tool.sh generate -i input/api_definition.xlsx  # JMX を生成（output/）
+./jmeter_api_tool.sh curl -i requests.curl -o input/api_definition.xlsx  # curl を xlsx の空白行と csv に 1 行追加
+./jmeter_api_tool.sh add-curl -c "curl https://api.example.com" --name "Example" --status 200  # 直接文字列から追加（add, add-curl も同等）
+./jmeter_api_tool.sh generate -i input/api_definition.xlsx  # JMX を生成（output/）。Linux 用 CLI 手順は *_cli.txt
+./jmeter_api_tool.sh generate -i input/api_definition.xlsx -t output/api_test.jmx  # 既存 JMX は差分だけ更新（-u も可。箇所は *_update.txt）
+./jmeter_api_tool.sh generate -i input/api_definition.xlsx -t output/api_test.jmx --diff  # 差分の確認だけ（JMX は書き換えない）
+./jmeter_api_tool.sh cli -t output/api_test.jmx             # 既存 JMX から Linux CLI 手順を作り直す
+./jmeter_api_tool.sh generate -i openapi.json -t output/api_test.jmx  # OpenAPI でも同じ
 ./jmeter_api_tool.sh generate -i input/api_definition.xlsx -n order_test.jmx   # 出力する JMX のファイル名を指定
 ./jmeter_api_tool.sh generate -i openapi.json --seed 12345  # OpenAPI 定義（JSON）から JMX を生成
 ./jmeter_api_tool.sh generate -i openapi.json -c input/openapi_config.csv   # 接続先・ヘッダ・トークンを OpenAPI 用設定ファイルで指定
@@ -42,7 +64,13 @@ chmod +x jmeter_api_tool.sh
 
 ```powershell
 .\jmeter_api_tool.bat init
+.\jmeter_api_tool.bat curl -i requests.curl -o input\api_definition.xlsx
+.\jmeter_api_tool.bat add-curl -Curl "curl https://api.example.com" -Name "Example" -Status 200  # 直接文字列から追加（add, add-curl も同等）
 .\jmeter_api_tool.bat generate -i input\api_definition.xlsx
+.\jmeter_api_tool.bat generate -i input\api_definition.xlsx -t output\api_test.jmx
+.\jmeter_api_tool.bat generate -i input\api_definition.xlsx -t output\api_test.jmx -Diff
+.\jmeter_api_tool.bat cli -t output\api_test.jmx
+.\jmeter_api_tool.bat generate -i openapi.json -t output\api_test.jmx
 .\jmeter_api_tool.bat generate -i input\api_definition.xlsx -JmxName order_test.jmx
 .\jmeter_api_tool.bat generate -i openapi.json -Seed 12345
 .\jmeter_api_tool.bat generate -i openapi.json -c input\openapi_config.csv
@@ -57,7 +85,7 @@ chmod +x jmeter_api_tool.sh
 ## OpenAPI 定義（JSON）からの生成
 
 `-i` に OpenAPI 3.0.x の JSON（拡張子 `.json`）を指定すると、Excel / CSV と同じ「API一覧」の 1 行 = 1 API に変換してから JMX を生成します。
-定義の読み込みとテストデータの生成は JMeter_Tools の `openapi2jmx`（`OpenApi2Jmx.ps1`）と同じ処理で、同じシードなら同じテストデータになります。
+定義の読み込みとテストデータの生成は JMeter_Tools の `openapi2jmx`（`OpenApi2Jmx.ps1`）と同じ処理で、同じシードなら同じテストデータになります。既存の JMX を `-t` で指定すると、Excel / CSV と同じく差分だけを更新します。
 
 | API一覧の列 | OpenAPI から設定する値 |
 |---|---|
@@ -81,9 +109,9 @@ OpenAPI 定義から生成する場合だけ使う設定ファイルです。`in
 
 | 設定キー | 内容 |
 |---|---|
-| `PROTOCOL` / `HOST` / `PORT` | 共通変数（User Defined Variables）PROTOCOL / HOST / PORT の既定値。記入した項目だけ `base_url`（`servers[0].url`）の接続先を置き換え、パス（例: `/v1`）はそのまま使います。PORT が空欄の場合はポート番号を付けないため（未設定。http は 80 / https は 443 で接続）、ホスト名だけでも指定できます（3 項目とも空欄なら `base_url` のまま）。実行時の `-JPROTOCOL=` `-JHOST=` `-JPORT=` も従来どおり使えます |
+| `PROTOCOL` / `HOST` / `PORT` | 共通変数（User Defined Variables）PROTOCOL / HOST / PORT の既定値。記入した項目だけ `base_url`（`servers[0].url`）と operation / path の `servers` の接続先を置き換え、パス（例: `/v1`）と空欄のポートは元のままです。ポートを消して標準ポート（http は 80 / https は 443）にする場合は `PORT` に `default` と記入します（3 項目とも空欄なら `base_url` のまま）。実行時の `-JPROTOCOL=` `-JHOST=` `-JPORT=` も従来どおり使えます |
 | `HEADERS` | 全 API に付ける HTTP ヘッダ（「名前: 値」を改行区切り。例: `X-Api-Key: キーの値`）。共通ヘッダ（HTTP Header Manager）に追加し、設定 `common_headers` と同じ名前のヘッダはこちらを使います |
-| `API_HEADERS` | 各 API のヘッダ（API ごとの HTTP Header Manager）に入れる初期値（「名前: 値」を改行区切り）。既定値は `Accept: application/json` / `Transaction-ID: XXXXXXXXX` / `Transaction-Class: 1` / `User-ID: xxxxxxxx` / `API-Key: XXXXXXX` で、空欄の場合も既定値を使います（付けない場合は `なし`）。OpenAPI 定義から求めた同じ名前のヘッダ（応答の形式から求めた `Accept` など）はこちらの値を使います。生成後は JMeter で API ごとに変更でき、`HEADERS`（共通ヘッダ）と同じ名前のヘッダは実行時に API 側が優先されます |
+| `API_HEADERS` | 各 API のヘッダ（API ごとの HTTP Header Manager）に入れる初期値（「名前: 値」を改行区切り）。既定値は `Accept: application/json` / `Transaction-ID: XXXXXXXXX` / `Transaction-Class: 1` / `User-ID: xxxxxxxx` / `API-Key: XXXXXXX` で、空欄の場合も既定値を使います（付けない場合は `なし`）。既定値のままのときは、OpenAPI 定義から求めた同じ名前のヘッダ（応答の `Accept` など）を残し、定義に無い名前だけ追加します。既定値と違う値を書いたときだけ同じ名前を置き換えます。生成後は JMeter で API ごとに変更でき、`HEADERS`（共通ヘッダ）と同じ名前のヘッダは実行時に API 側が優先されます |
 | `TOKEN_DIR` | アクセストークンのフォルダ。指定すると共通ヘッダに `Authorization: Bearer ${ACCESS_TOKEN}` を追加し、JMeter の実行中に API を呼び出すたびに、このフォルダ直下の `*.token` のうち **更新日時が最も新しいファイル** の内容（前後の空白・改行・BOM を除く）を `${ACCESS_TOKEN}` に設定します（`HEADERS` に Authorization を書いた場合はその値を使用） |
 | `PUBLIC_BASE_URL` | OpenAPI 定義の `servers[0].url` のプレースホルダ `${public_base_url}` に入れる値。URL（例: `https://api.example.com/v1`）は接続先とパスの先頭に、パス（例: `/v1`）はパスの先頭（コンテキストルート）に使います（`PROTOCOL` / `HOST` / `PORT` を記入した場合は、その項目だけさらに置き換え）。空欄（既定）は未設定とし、`${public_base_url}` を取り除いてパスに付けません |
 | `NAME_PREFIX` | OpenAPI 定義のタイトル（`info.title`）のプレースホルダ `${name_prefix}` に入れる値（例: `dev` → テストプラン名 `dev-orders-api 1.0.0（OpenAPI 3.0.1）`、JMX `dev-orders-api.jmx`）。空欄（既定）は未設定とし、`${name_prefix}` を隣の区切り文字（`-` `_` `.` `/` 空白）ごと取り除きます |

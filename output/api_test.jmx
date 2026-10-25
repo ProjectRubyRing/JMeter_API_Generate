@@ -2,7 +2,7 @@
 <jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
   <hashTree>
     <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="APIテスト" enabled="true">
-      <stringProp name="TestPlan.comments">jmeter_api_tool v1.0.0 で生成（2026-10-11 05:00:27 / 入力: api_definition.xlsx）
+      <stringProp name="TestPlan.comments">jmeter_api_tool v1.1.0 で生成（2026-10-25 07:41:08 / 入力: api_definition.xlsx）
 名前が [必須] の要素は削除しないでください。[任意] の要素は不要であれば削除できます（各要素のコメント参照）。
 実行時の変更例: -JTHREADS=10 -JLOOPS=100 -JHOST=example.com</stringProp>
       <boolProp name="TestPlan.functional_mode">false</boolProp>
@@ -140,7 +140,7 @@ if (oldWriter != null) {
     } catch (Exception ignored) {
     }
 }
-[&apos;API_RESULT_TOTAL&apos;, &apos;API_RESULT_OK&apos;, &apos;API_RESULT_NG&apos;].each { props.remove(it) }
+[&apos;API_RESULT_TOTAL&apos;, &apos;API_RESULT_OK&apos;, &apos;API_RESULT_NG&apos;, &apos;ACCESS_TOKEN_LATEST&apos;, &apos;ACCESS_TOKEN_CACHE&apos;].each { props.remove(it) }
 props.put(&apos;API_TEST_START_MS&apos;, String.valueOf(System.currentTimeMillis()))
 log.info(&apos;==== テスト開始: &apos; + (Parameters ?: &apos;&apos;))
 </stringProp>
@@ -183,8 +183,10 @@ if (path.isEmpty()) {
     return
 }
 File file = new File(path)
+String p = path.trim().replace(&apos;\\&apos;, &apos;/&apos;)
+File file = new File(p.startsWith(&apos;~/&apos;) ? p.substring(2) : p)
 if (!file.isAbsolute()) {
-    file = new File(FileServer.getFileServer().getBaseDir(), path)
+    file = new File(FileServer.getFileServer().getBaseDir(), file.getPath())
 }
 if (!file.isFile()) {
     log.warn(&apos;[Excel] ファイルが見つかりません: &apos; + file.getAbsolutePath())
@@ -966,8 +968,7 @@ if (writer != null) {
         writer.close()
     }
 }
-props.remove(&apos;EXCEL_DATA&apos;)
-props.remove(&apos;EXCEL_ROW_COUNTER&apos;)
+[&apos;EXCEL_DATA&apos;, &apos;EXCEL_ROW_COUNTER&apos;, &apos;ACCESS_TOKEN_LATEST&apos;, &apos;ACCESS_TOKEN_CACHE&apos;].each { props.remove(it) }
 </stringProp>
         </JSR223Sampler>
         <hashTree/>
@@ -1200,7 +1201,8 @@ count(res.isSuccessful() ? &apos;API_RESULT_OK&apos; : &apos;API_RESULT_NG&apos;
 
 // 出力ファイル（最初の1件で作成し、全スレッドで共有）
 def writer = props.computeIfAbsent(&apos;API_RESULT_LOG_WRITER&apos;, { k -&gt;
-    File dir = dirText.startsWith(&apos;~/&apos;) ? new File(FileServer.getFileServer().getBaseDir(), dirText.substring(2)) : new File(dirText)
+    String normDir = dirText.replace(&apos;\\&apos;, &apos;/&apos;)
+    File dir = normDir.startsWith(&apos;~/&apos;) ? new File(FileServer.getFileServer().getBaseDir(), normDir.substring(2)) : new File(dirText)
     dir.mkdirs()
     File file = new File(dir, &apos;api_result.log&apos;)
     boolean isNew = !file.exists() || file.length() == 0

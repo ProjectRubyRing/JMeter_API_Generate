@@ -1,6 +1,6 @@
 # JMeter APIテスト 利用方法
 
-> 対象: Apache JMeter 5.6.3 ／ RHEL 9.8 ／ Windows 11 ／ ツール: jmeter_api_tool v1.0.0（2026-10-24 出力）
+> 対象: Apache JMeter 5.6.3 ／ RHEL 9.8 ／ Windows 11 ／ ツール: jmeter_api_tool v1.1.0（2026-10-25 出力）
 
 本書は、REST API の定義（URL・HTTPメソッド・クエリパラメータ・ヘッダ・リクエストボディ）を Excel または CSV に記入し、JMeter のテスト計画ファイル（JMX）を自動生成して実行し、結果を確認するまでの手順をまとめたものです。
 
@@ -9,9 +9,13 @@
 
 ### このツールでできること
 - Excel / CSV に記入した API 定義から、JMeter 5.6.3 用の JMX ファイルを自動生成します。
+- curl コマンドを解析し、api_definition.xlsx の空白行と api_definition.csv に 1 行追加します。
 - 生成される JMX には、API テストでよく使う要素（待機タイマ、連番・乱数、CSV / Excel データ読込、クッキー、前処理・後処理、正規表現 / JSON 抽出、応答の検証、結果出力）があらかじめ組み込まれています。
 - 既定は「1スレッド × 1回」の実行です。実行時のプロパティ指定（例: -JTHREADS=10 -JLOOPS=100）だけで、大量件数の負荷試験に切り替えられます。
 - 実行結果は JTL（CSV）、HTML レポート、jmeter.log、結果ログ（api_result.log）、エラー詳細（error_detail.xml）に出力されます。
+- generate は JMX と同じフォルダに、Linux の JMeter CLI 実行コマンドと各パラメータの説明（*_cli.txt）を出力します。
+- 既存の JMX を -t で指定すると、新規の JMX は作らず、Excel / CSV / OpenAPI の定義との差分だけをその JMX へ更新します。更新箇所は画面と *_update.txt に表示します。手で追加した要素は残します。--diff（PowerShell は -Diff）を付けると、JMX は書き換えずに差分だけを表示します。
+- cli コマンドは、既存の JMX から Linux 用 CLI 手順（*_cli.txt）を作り直します。手順書には環境変数、nohup によるバックグラウンド実行、jmeter -g によるレポート再生成も含みます。
 - 生成される要素の名前には [必須] / [任意] を付けています。[任意] の要素は JMeter GUI で右クリック →「削除」するだけで、他の要素に影響を与えずに取り除けます。
 
 ### ファイル構成
@@ -123,6 +127,23 @@ input フォルダに次の 4 ファイルが作成されます（既存ファ�
 - api_definition_settings.csv（CSV 形式：設定）
 - openapi_config.csv（CSV 形式：OpenAPI 定義から生成する場合の接続先・HTTP ヘッダ・アクセストークン・定義の変数 ${public_base_url} / ${name_prefix} の値。generate の -c / -OpenApiConfig で指定）
 
+### curl コマンドから API 定義を作る
+curl コマンドをファイルに書いて実行すると、既存の api_definition.xlsx の最初の空白行と、同じ名前の api_definition.csv の末尾に 1 行追加します。curl 1 件が 1 行です。既存の API 行と「設定」シートは変更しません。ファイルには複数コマンドを書けます。行継続（\、^、バッククォート）と引用符に対応します。
+
+```bash
+./jmeter_api_tool.sh curl -i requests.curl -o input/api_definition.xlsx
+./jmeter_api_tool.sh generate -i input/api_definition.xlsx
+```
+```powershell
+.\jmeter_api_tool.bat curl -i requests.curl -o input\api_definition.xlsx
+.\jmeter_api_tool.bat generate -i input\api_definition.xlsx
+```
+- URL の ? 以降は「クエリパラメータ」列に分けます。-G と --data-urlencode もクエリになります。
+- -d / --json / -F は本文とボディ形式にします。-d で Content-Type を書いていない場合は、curl と同じ application/x-www-form-urlencoded として取り込みます（JSON に見える文字列でも application/json にはしません）。
+- もう一度実行すると、その続きの空白行（CSV は末尾）にさらに 1 行追加します。
+- ファイルが無い場合は、テンプレートの記入例の次の空白行から追加します。
+- 期待ステータスは空欄です。必要なら記入してから generate してください。
+
 ### 手順2：API 定義を記入する
 - Excel 形式：「API一覧」シートに 1行 = 1API で記入し、「設定」シートの「設定値」列で全体設定を変更します。
 - CSV 形式：api_definition.csv に API を、api_definition_settings.csv に設定を記入します。
@@ -146,20 +167,34 @@ input フォルダに次の 4 ファイルが作成されます（既存ファ�
 <!-- cols: 22,30,66 -->
 | sh のオプション | PowerShell のオプション | 説明 |
 |---|---|---|
-| -i ファイル | -InputFile（-i） | 入力ファイル（.xlsx / .csv）。必須 |
+| -i ファイル | -InputFile（-i） | 入力ファイル（.xlsx / .csv / .json）。必須 |
 | -s ファイル | -SettingsFile（-s） | 設定 CSV。省略時は「入力ファイル名_settings.csv」を探し、無ければ既定値を使用（Excel 入力時は「設定」シートを使用） |
 | -o フォルダ | -OutDir（-o） | 出力先フォルダ（既定: output） |
 | -n ファイル名 | -JmxName（-n） | 出力する JMX のファイル名（例: order_test.jmx）。設定「出力JMXファイル名」（output_file）より優先します |
 | --split | -Split | API ごとに別々の JMX を出力する |
 | -f | -Force（-f） | サンプルデータ（data/testdata.csv / .xlsx）が既にあっても上書きする |
+| -t ファイル | -Jmx（-t） | 既存の JMX。指定すると新規作成せず、Excel / CSV / OpenAPI の定義との差分だけをそのファイルへ更新する。更新箇所は画面と *_update.txt に表示する。--split とは同時に使えない |
 
 ### 生成されるファイル
 <!-- cols: 34,84 -->
 | ファイル | 説明 |
 |---|---|
-| output/出力JMXファイル名 | 生成された JMX。同名のファイルがある場合は「.日時.bak」を付けて退避してから作成します |
+| output/出力JMXファイル名 | 生成された JMX。同名のファイルがある場合は「.日時.bak」を付けて退避してから作成します。-t で既存の JMX を指定したときは、退避せず差分だけを更新します |
+| output/出力JMXファイル名_cli.txt | Linux サーバで JMeter CLI を実行するコマンドと、各パラメータの説明。JMX と同じフォルダに出力する |
+| output/出力JMXファイル名_update.txt | -t で既存の JMX を更新したときの更新箇所。差分が無いときも出力する |
 | output/data/testdata.csv | CSV データ読込用のサンプル（ファイルが無い場合のみ作成） |
 | output/data/testdata.xlsx | Excel データ読込用のサンプル（ファイルが無い場合のみ作成） |
+
+既存の JMX を更新する場合は、-t にそのファイルを指定します。Excel、CSV、OpenAPI のどれからでも同じです。新しい JMX は作らず、定義と違う箇所だけを書き換えます。更新・追加・削除した箇所は画面に表示し、JMX と同じフォルダの *_update.txt にも書きます。名前が [必須] / [任意] で始まらない要素、および APIxx ではないサンプラは、手で追加したものとして残します。差分が無いときは JMX を書き換えません。
+
+```bash
+./jmeter_api_tool.sh generate -i input/api_definition.xlsx -t output/api_test.jmx
+./jmeter_api_tool.sh generate -i openapi.json -t output/api_test.jmx
+```
+```powershell
+.\jmeter_api_tool.bat generate -i input\api_definition.xlsx -t output\api_test.jmx
+.\jmeter_api_tool.bat generate -i openapi.json -t output\api_test.jmx
+```
 
 ### 手順4：JMeter GUI で確認・調整する
 - RHEL（デスクトップ環境あり）：`jmeter -t output/api_test.jmx`
@@ -268,7 +303,7 @@ input フォルダに次の 4 ファイルが作成されます（既存ファ�
 - 先頭の列（No）が # で始まる行はコメントとして読み飛ばします（テンプレートの 4 行目の記入説明など）。
 - URL・パラメータ・ヘッダ・ボディには ${変数名} で JMeter の変数・関数を埋め込めます（例: `${USER_ID}`、`${SEQ}`、`${__UUID()}`）。
 - 「有効」を N にした API は、生成はされますが無効化された状態になります。
-- GET / DELETE のクエリパラメータは HTTP リクエストの「Parameters」タブに設定されます。POST / PUT / PATCH の場合は URL のパスに付与されます（値は UTF-8 で URL エンコード。${...} の部分はそのまま）。
+- GET / DELETE / HEAD / OPTIONS のクエリパラメータは HTTP リクエストの「Parameters」タブに設定されます。POST / PUT / PATCH の場合は URL のパスに付与されます（値は UTF-8 で URL エンコード。${...} の部分はそのまま）。
 - 既に URL エンコード済みの値（%E3%83%86 など）は、二重にエンコードしないよう自動で判定します。
 - GET / DELETE ではリクエストボディは使用できません（指定した場合は警告を表示して無視します）。
 
